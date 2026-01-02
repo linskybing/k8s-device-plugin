@@ -1,0 +1,33 @@
+version: v1
+flags:
+  migStrategy: none
+sharing:
+  # Use MPS sharing for replicas; set replicas per GPU below.
+  mps:
+    renameByDefault: true
+    failRequestsGreaterThanOne: true
+individualGPU:
+  enabled: true
+  namePattern: gpu%d   # gpu0, gpu1, gpu2, gpu3 per node
+  gpuConfigs:
+    - index: 0
+      name: gpu0
+      mps:
+        enabled: true
+        replicas: 2            # two MPS slices on GPU0
+        activeThreadLimit: 4   # optional; omit to let pod set
+    - index: 1
+      name: gpu1
+      mps:
+        enabled: true
+        replicas: 2
+    - index: 2
+      name: gpu2
+      mps:
+        enabled: true
+        replicas: 2
+    - index: 3
+      name: gpu3
+      mps:
+        enabled: true
+        replicas: 2

@@ -24,6 +24,7 @@ import (
 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"k8s.io/klog/v2"
+	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
 )
@@ -47,6 +48,11 @@ func NewNVMLResourceManagers(infolib info.Interface, nvmllib nvml.Interface, dev
 			klog.Infof("Error shutting down NVML: %v", ret)
 		}
 	}()
+
+	// If IndividualGPU mode is enabled, create a separate resource manager for each GPU
+	if config.IndividualGPU != nil && config.IndividualGPU.Enabled {
+		return newIndividualGPUResourceManagers(infolib, nvmllib, devicelib, config)
+	}
 
 	deviceMap, err := NewDeviceMap(infolib, devicelib, config)
 	if err != nil {
@@ -136,4 +142,121 @@ func (r *nvmlResourceManager) alignedAlloc(available, required []string, size in
 	}
 
 	return devices, nil
+}
+
+// newIndividualGPUResourceManagers creates a separate ResourceManager for each GPU
+func newIndividualGPUResourceManagers(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, config *spec.Config) ([]ResourceManager, error) {
+	var rms []ResourceManager
+
+	// Build a deviceMapBuilder to enumerate GPUs
+	b := deviceMapBuilder{
+		Interface:   devicelib,
+		migStrategy: config.Flags.MigStrategy,
+		resources:   &config.Resources,
+	}
+
+	if infolib.ResolvePlatform() == info.PlatformWSL {
+		b.newGPUDevice = newWslGPUDevice
+	} else {
+		b.newGPUDevice = newNvmlGPUDevice
+	}
+
+	// Enumerate all GPUs and create a ResourceManager for each
+	err := b.VisitDevices(func(i int, gpu device.Device) error {
+		// Skip MIG-enabled GPUs if MIG strategy is not none
+		migEnabled, err := gpu.IsMigEnabled()
+		if err != nil {
+			return fmt.Errorf("error checking if MIG is enabled on GPU %d: %v", i, err)
+		}
+		if migEnabled && *b.migStrategy != spec.MigStrategyNone {
+			return nil
+		}
+
+		// Get GPU config for this index
+		var gpuConfig *spec.GPUConfig
+		gpuUUID, _ := gpu.GetUUID()
+		for j := range config.IndividualGPU.GPUConfigs {
+			candidate := &config.IndividualGPU.GPUConfigs[j]
+			if candidate.Index == i {
+				gpuConfig = candidate
+				break
+			}
+			if candidate.UUID != "" && gpuUUID == candidate.UUID {
+				gpuConfig = candidate
+				break
+			}
+		}
+
+		// If no specific config, create a default one
+		if gpuConfig == nil {
+			gpuConfig = &spec.GPUConfig{
+				Index: i,
+			}
+		}
+
+		// Get resource name for this GPU
+		resourceName, err := gpuConfig.GetResourceName(config.IndividualGPU.NamePattern)
+		if err != nil {
+			return fmt.Errorf("error getting resource name for GPU %d: %v", i, err)
+		}
+
+		// Build device info
+		index, deviceInfo := b.newGPUDevice(i, gpu)
+		dev, err := BuildDevice(index, deviceInfo)
+		if err != nil {
+			return fmt.Errorf("error building device for GPU %d: %v", i, err)
+		}
+
+		// Create devices map with this single GPU
+		devices := make(Devices)
+		devices[dev.ID] = dev
+
+		// Handle MPS replication if enabled for this GPU
+		replicas := 1
+		if gpuConfig.MPS != nil && gpuConfig.MPS.Enabled {
+			replicas = gpuConfig.MPS.Replicas
+			if replicas == 0 {
+				replicas = 1
+			}
+		}
+		if replicas > 1 {
+			replicatedDevices := make(Devices)
+			for replica := 0; replica < replicas; replica++ {
+				annotatedID := string(NewAnnotatedID(dev.ID, replica))
+				replicatedDevice := Device{
+					Device: pluginapi.Device{
+						ID:       annotatedID,
+						Health:   dev.Health,
+						Topology: dev.Topology,
+					},
+					Paths:             dev.Paths,
+					Index:             dev.Index,
+					TotalMemory:       dev.TotalMemory,
+					ComputeCapability: dev.ComputeCapability,
+					Replicas:          replicas,
+				}
+				replicatedDevices[annotatedID] = &replicatedDevice
+			}
+			devices = replicatedDevices
+		}
+
+		// Create ResourceManager for this GPU
+		rm := &nvmlResourceManager{
+			resourceManager: resourceManager{
+				config:   config,
+				resource: resourceName,
+				devices:  devices,
+			},
+			nvml: nvmllib,
+		}
+		rms = append(rms, rm)
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error creating individual GPU resource managers: %v", err)
+	}
+
+	return rms, nil
 }

@@ -33,13 +33,19 @@ type mpsOptions struct {
 	resourceName spec.ResourceName
 	daemon       *mps.Daemon
 	hostRoot     mps.Root
+	mpsConfig    *spec.GPUMPSConfig
 }
 
 // getMPSOptions returns the MPS options specified for the resource manager.
 // If MPS is not configured and empty set of options is returned.
 func (o *options) getMPSOptions(resourceManager rm.ResourceManager) (mpsOptions, error) {
-	if o.config.Sharing.SharingStrategy() != spec.SharingStrategyMPS {
-		return mpsOptions{}, nil
+	// Determine if MPS is enabled globally (sharing strategy) or per-GPU
+	sharingEnabled := o.config.Sharing.SharingStrategy() == spec.SharingStrategyMPS
+	gpuConfig := o.getGPUConfigForResource(resourceManager.Resource())
+	if !sharingEnabled {
+		if gpuConfig == nil || gpuConfig.MPS == nil || !gpuConfig.MPS.Enabled {
+			return mpsOptions{}, nil
+		}
 	}
 
 	// TODO: It might make sense to pull this logic into a resource manager.
@@ -49,13 +55,40 @@ func (o *options) getMPSOptions(resourceManager rm.ResourceManager) (mpsOptions,
 		}
 	}
 
+	var mpsCfg *spec.GPUMPSConfig
+	if gpuConfig != nil {
+		mpsCfg = gpuConfig.MPS
+	}
+	if mpsCfg != nil && !mpsCfg.Enabled {
+		mpsCfg = nil
+	}
+
 	m := mpsOptions{
 		enabled:      true,
 		resourceName: resourceManager.Resource(),
-		daemon:       mps.NewDaemon(resourceManager, mps.ContainerRoot),
+		daemon:       mps.NewDaemon(resourceManager, mps.ContainerRoot, mpsCfg),
 		hostRoot:     mps.Root(*o.config.Flags.MpsRoot),
+		mpsConfig:    mpsCfg,
 	}
 	return m, nil
+}
+
+// getGPUConfigForResource returns the GPU config that matches the resource name, if any.
+func (o *options) getGPUConfigForResource(resourceName spec.ResourceName) *spec.GPUConfig {
+	if o.config == nil || o.config.IndividualGPU == nil {
+		return nil
+	}
+	for i := range o.config.IndividualGPU.GPUConfigs {
+		cfg := &o.config.IndividualGPU.GPUConfigs[i]
+		name, err := cfg.GetResourceName(o.config.IndividualGPU.NamePattern)
+		if err != nil {
+			continue
+		}
+		if name == resourceName {
+			return cfg
+		}
+	}
+	return nil
 }
 
 func (m *mpsOptions) waitForDaemon() error {
@@ -76,7 +109,9 @@ func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse
 		return
 	}
 	// TODO: We should check that the deviceIDs are shared using MPS.
-	response.Envs["CUDA_MPS_PIPE_DIRECTORY"] = m.daemon.PipeDir()
+	for k, v := range m.daemon.EnvVars() {
+		response.Envs[k] = v
+	}
 
 	response.Mounts = append(response.Mounts,
 		&pluginapi.Mount{

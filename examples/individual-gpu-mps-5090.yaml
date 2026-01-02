@@ -1,0 +1,24 @@
+version: v1
+flags:
+  migStrategy: none
+sharing:
+  mps:
+    renameByDefault: true
+    failRequestsGreaterThanOne: true
+individualGPU:
+  enabled: true
+  namePattern: gpu%d
+  gpuConfigs:
+    - index: 0
+      name: gpu0
+      mps:
+        enabled: true
+        replicas: 2
+        activeThreadLimit: 4
+        pinnedMemoryLimit: 1024
+    - index: 1
+      name: gpu1
+      mps:
+        enabled: true
+        replicas: 2
+        activeThreadPercentage: 50

@@ -28,6 +28,7 @@ import (
 	"github.com/opencontainers/selinux/go-selinux"
 	"k8s.io/klog/v2"
 
+	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
 	"github.com/NVIDIA/k8s-device-plugin/internal/rm"
 )
 
@@ -53,13 +54,16 @@ type Daemon struct {
 	root Root
 	// logTailer tails the MPS control daemon logs.
 	logTailer *tailer
+	// mpsConfig carries per-GPU MPS tuning (thread limits, pinned memory)
+	mpsConfig *spec.GPUMPSConfig
 }
 
 // NewDaemon creates an MPS daemon instance.
-func NewDaemon(rm rm.ResourceManager, root Root) *Daemon {
+func NewDaemon(rm rm.ResourceManager, root Root, cfg *spec.GPUMPSConfig) *Daemon {
 	return &Daemon{
-		rm:   rm,
-		root: root,
+		rm:        rm,
+		root:      root,
+		mpsConfig: cfg,
 	}
 }
 
@@ -82,10 +86,14 @@ func (e envvars) toSlice() []string {
 // These should be passed to clients consuming the device shared using MPS.
 // TODO: Set CUDA_VISIBLE_DEVICES to include only the devices for this resource type.
 func (d *Daemon) EnvVars() envvars {
-	return map[string]string{
+	env := map[string]string{
 		"CUDA_MPS_PIPE_DIRECTORY": d.PipeDir(),
 		"CUDA_MPS_LOG_DIRECTORY":  d.LogDir(),
 	}
+	if d.mpsConfig != nil && d.mpsConfig.ActiveThreadLimit > 0 {
+		env["CUDA_MPS_ACTIVE_THREAD_LIMIT"] = fmt.Sprintf("%d", d.mpsConfig.ActiveThreadLimit)
+	}
+	return env
 }
 
 // Start starts the MPS deamon as a background process.
@@ -264,6 +272,12 @@ func (m *Daemon) perDevicePinnedDeviceMemoryLimits() map[string]string {
 		if totalMemory == 0 {
 			continue
 		}
+		// If a pinned memory limit is explicitly set in config, apply it per device
+		if m.mpsConfig != nil && m.mpsConfig.PinnedMemoryLimit > 0 {
+			limits[index] = fmt.Sprintf("%dM", m.mpsConfig.PinnedMemoryLimit)
+			continue
+		}
+
 		replicas := replicasPerDevice[index]
 		limits[index] = fmt.Sprintf("%vM", totalMemory/replicas/1024/1024)
 	}
@@ -274,7 +288,9 @@ func (m *Daemon) activeThreadPercentage() string {
 	if len(m.Devices()) == 0 {
 		return ""
 	}
-	replicasPerDevice := len(m.Devices()) / len(m.Devices().GetUUIDs())
-
-	return fmt.Sprintf("%d", 100/replicasPerDevice)
+	if m.mpsConfig != nil && m.mpsConfig.ActiveThreadPercentage > 0 {
+		return fmt.Sprintf("%d", m.mpsConfig.ActiveThreadPercentage)
+	}
+	// No explicit percentage configured: leave unset so the client can decide.
+	return ""
 }

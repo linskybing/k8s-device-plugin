@@ -62,8 +62,9 @@ func New(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interf
 		opt(m)
 	}
 
-	if strategy := m.config.Sharing.SharingStrategy(); strategy != spec.SharingStrategyMPS {
-		klog.InfoS("Sharing strategy is not MPS; skipping MPS manager creation", "strategy", strategy)
+	strategy := m.config.Sharing.SharingStrategy()
+	if strategy != spec.SharingStrategyMPS && !m.hasPerResourceMPS() {
+		klog.InfoS("Sharing strategy is not MPS and no per-GPU MPS config set; skipping MPS manager creation", "strategy", strategy)
 		return &nullManager{}, nil
 	}
 
@@ -98,7 +99,15 @@ func (m *manager) Daemons() ([]*Daemon, error) {
 				return nil, fmt.Errorf("invalid MPS configuration: %w", err)
 			}
 		}
-		daemon := NewDaemon(resourceManager, ContainerRoot)
+		cfg := m.gpuConfigForResource(resourceManager.Resource())
+		var mpsCfg *spec.GPUMPSConfig
+		if cfg != nil {
+			mpsCfg = cfg.MPS
+		}
+		if mpsCfg != nil && !mpsCfg.Enabled {
+			mpsCfg = nil
+		}
+		daemon := NewDaemon(resourceManager, ContainerRoot, mpsCfg)
 		daemons = append(daemons, daemon)
 	}
 
@@ -108,4 +117,35 @@ func (m *manager) Daemons() ([]*Daemon, error) {
 // Daemons always returns an empty slice for a nullManager.
 func (m *nullManager) Daemons() ([]*Daemon, error) {
 	return nil, nil
+}
+
+// hasPerResourceMPS returns true if any GPU config enables MPS explicitly.
+func (m *manager) hasPerResourceMPS() bool {
+	if m.config == nil || m.config.IndividualGPU == nil {
+		return false
+	}
+	for i := range m.config.IndividualGPU.GPUConfigs {
+		if cfg := m.config.IndividualGPU.GPUConfigs[i].MPS; cfg != nil && cfg.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// gpuConfigForResource finds the GPU config matching a resource name.
+func (m *manager) gpuConfigForResource(resource spec.ResourceName) *spec.GPUConfig {
+	if m.config == nil || m.config.IndividualGPU == nil {
+		return nil
+	}
+	for i := range m.config.IndividualGPU.GPUConfigs {
+		cfg := &m.config.IndividualGPU.GPUConfigs[i]
+		name, err := cfg.GetResourceName(m.config.IndividualGPU.NamePattern)
+		if err != nil {
+			continue
+		}
+		if name == resource {
+			return cfg
+		}
+	}
+	return nil
 }
