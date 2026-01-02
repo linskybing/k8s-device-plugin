@@ -19,6 +19,8 @@ package plugin
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
@@ -34,6 +36,7 @@ type mpsOptions struct {
 	daemon       *mps.Daemon
 	hostRoot     mps.Root
 	mpsConfig    *spec.GPUMPSConfig
+	rm           rm.ResourceManager
 }
 
 // getMPSOptions returns the MPS options specified for the resource manager.
@@ -69,6 +72,7 @@ func (o *options) getMPSOptions(resourceManager rm.ResourceManager) (mpsOptions,
 		daemon:       mps.NewDaemon(resourceManager, mps.ContainerRoot, mpsCfg),
 		hostRoot:     mps.Root(*o.config.Flags.MpsRoot),
 		mpsConfig:    mpsCfg,
+		rm:           resourceManager,
 	}
 	return m, nil
 }
@@ -104,83 +108,131 @@ func (m *mpsOptions) waitForDaemon() error {
 	return nil
 }
 
-func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse, replicaCount int) {
+func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse, requestIds []string) {
 	if m == nil || !m.enabled {
 		return
 	}
+
+	// Build per-GPU allocation counts from annotated IDs (base ID + replica index)
+	perGPUCount := make(map[string]int)
+	for _, id := range requestIds {
+		annotated := rm.AnnotatedID(id)
+		base := annotated.GetID()
+		perGPUCount[base]++
+	}
+
+	// Collect unique GPU indices and UUID mapping keyed by base IDs (strip replica suffixes)
+	seenIndex := make(map[string]bool)
+	seenBase := make(map[string]bool)
+	indexQuota := make(map[string]int)
+	var indices []string
+	var gpuMapParts []string
+	for _, reqID := range requestIds {
+		annotated := rm.AnnotatedID(reqID)
+		baseID := annotated.GetID()
+
+		// Prefer daemon device map; fall back to resource manager devices.
+		var dev *rm.Device
+		if m.daemon != nil && m.daemon.Devices() != nil {
+			dev = m.daemon.Devices().GetByID(reqID)
+			if dev == nil {
+				dev = m.daemon.Devices().GetByID(baseID)
+			}
+		}
+		if dev == nil && m.rm != nil {
+			dev = m.rm.Devices().GetByID(baseID)
+		}
+		if dev == nil {
+			klog.InfoS("Skipping unknown requested GPU", "id", reqID, "baseID", baseID)
+			continue
+		}
+		indexQuota[dev.Index]++
+		if !seenIndex[dev.Index] {
+			seenIndex[dev.Index] = true
+			indices = append(indices, dev.Index)
+		}
+		if !seenBase[baseID] {
+			seenBase[baseID] = true
+			gpuMapParts = append(gpuMapParts, fmt.Sprintf("%s:%s:%d", dev.Index, baseID, perGPUCount[baseID]))
+		}
+	}
+
+	sort.Strings(indices)
+
 	// Inject MPS pipe and log directories
+	if response.Envs == nil {
+		response.Envs = make(map[string]string)
+	}
 	for k, v := range m.daemon.EnvVars() {
 		response.Envs[k] = v
 	}
 
-	// Auto-calculate and inject CUDA_MPS_ACTIVE_THREAD_PERCENTAGE based on replica count
-	// This prevents pods from tampering with the value while allowing per-pod customization
-	if replicaCount > 0 && m.mpsConfig != nil && m.mpsConfig.Replicas > 0 {
-		// Thread percentage = (requested replicas / total replicas) * 100
-		threadPercentage := (replicaCount * 100) / int(m.mpsConfig.Replicas)
-		if threadPercentage > 100 {
-			threadPercentage = 100
+	// Compute thread percentage based on number of distinct GPUs allocated
+	if len(indices) > 0 {
+		perGPUPercentage := 100 / len(indices)
+		if perGPUPercentage < 1 {
+			perGPUPercentage = 1
 		}
-		if threadPercentage > 0 {
-			response.Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", threadPercentage)
-			klog.InfoS("Injecting MPS thread percentage based on replica request",
-				"resource", m.resourceName,
-				"requested", replicaCount,
-				"total", m.mpsConfig.Replicas,
-				"percentage", threadPercentage)
-		}
-	}
-
-	// CRITICAL: Set NVIDIA_VISIBLE_DEVICES to enable GPU access in container
-	// Without this, nvidia-container-runtime sets it to "void" which disables GPU access
-	// We use the device index (e.g., "1") to match CUDA_VISIBLE_DEVICES
-	if cvd := m.daemon.VisibleDevices(); cvd != "" {
-		response.Envs["NVIDIA_VISIBLE_DEVICES"] = cvd
-		klog.InfoS("Setting NVIDIA_VISIBLE_DEVICES to enable GPU access",
+		response.Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", perGPUPercentage)
+		klog.InfoS("Injecting MPS thread percentage for multi-GPU",
 			"resource", m.resourceName,
-			"value", cvd)
+			"gpuCount", len(indices),
+			"percentage", perGPUPercentage)
 	}
 
+	// Visible devices scoped to the indices chosen
+	merged := strings.Join(indices, ",")
+	if merged != "" {
+		response.Envs["NVIDIA_VISIBLE_DEVICES"] = merged
+		response.Envs["CUDA_VISIBLE_DEVICES"] = merged
+		klog.InfoS("Setting merged visible devices",
+			"resource", m.resourceName,
+			"value", merged)
+	}
+
+	if len(indexQuota) > 0 {
+		var quotaParts []string
+		for _, idx := range indices {
+			quotaParts = append(quotaParts, fmt.Sprintf("%s:%d", idx, indexQuota[idx]))
+		}
+		sort.Strings(quotaParts)
+		response.Envs["MPS_GPU_QUOTA"] = strings.Join(quotaParts, ";")
+		klog.InfoS("Setting user-visible GPU quota map", "resource", m.resourceName, "value", response.Envs["MPS_GPU_QUOTA"])
+	}
+
+	// Expose mapping and per-GPU token usage
+	if len(gpuMapParts) > 0 {
+		sort.Strings(gpuMapParts)
+		response.Envs["GPU_DEVICE_MAP"] = strings.Join(gpuMapParts, ";")
+		// Also surface as annotation for external schedulers if supported
+		if response.Annotations == nil {
+			response.Annotations = make(map[string]string)
+		}
+		response.Annotations["mps.nvidia.com/assigned-gpus"] = strings.Join(indices, ",")
+		response.Annotations["mps.nvidia.com/gpu-device-map"] = strings.Join(gpuMapParts, ";")
+	}
+
+	// Mounts: pipe and shm (shared across all GPUs in this resource)
 	response.Mounts = append(response.Mounts,
-		&pluginapi.Mount{
-			ContainerPath: m.daemon.PipeDir(),
-			HostPath:      m.hostRoot.PipeDir(m.resourceName),
-		},
-		&pluginapi.Mount{
-			ContainerPath: m.daemon.ShmDir(),
-			HostPath:      m.hostRoot.ShmDir(m.resourceName),
-		},
+		&pluginapi.Mount{ContainerPath: m.daemon.PipeDir(), HostPath: m.hostRoot.PipeDir(m.resourceName)},
+		&pluginapi.Mount{ContainerPath: m.daemon.ShmDir(), HostPath: m.hostRoot.ShmDir(m.resourceName)},
 	)
 
-	// Add GPU device files so container runtime can access the hardware
-	// The device index is extracted from CUDA_VISIBLE_DEVICES
-	if cvd := m.daemon.VisibleDevices(); cvd != "" {
-		// Add main GPU device (e.g., /dev/nvidia1)
-		gpuDevice := "/dev/nvidia" + cvd
-		response.Devices = append(response.Devices, &pluginapi.DeviceSpec{
-			ContainerPath: gpuDevice,
-			HostPath:      gpuDevice,
-			Permissions:   "rw",
-		})
-
-		// Add required nvidia control devices
-		controlDevices := []string{
-			"/dev/nvidiactl",
-			"/dev/nvidia-uvm",
-			"/dev/nvidia-uvm-tools",
-			"/dev/nvidia-modeset",
-		}
-		for _, dev := range controlDevices {
-			response.Devices = append(response.Devices, &pluginapi.DeviceSpec{
-				ContainerPath: dev,
-				HostPath:      dev,
-				Permissions:   "rw",
-			})
-		}
-
-		klog.InfoS("Added GPU device specs for MPS",
-			"resource", m.resourceName,
-			"gpuDevice", gpuDevice,
-			"controlDevices", len(controlDevices))
+	// Add GPU device files for all selected indices
+	controlDevices := []string{"/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools", "/dev/nvidia-modeset"}
+	for _, idx := range indices {
+		gpuDevice := "/dev/nvidia" + idx
+		response.Devices = append(response.Devices, &pluginapi.DeviceSpec{ContainerPath: gpuDevice, HostPath: gpuDevice, Permissions: "rw"})
 	}
+	if len(indices) == 0 {
+		klog.InfoS("No GPU indices resolved for MPS request", "resource", m.resourceName, "requestIds", requestIds, "perGPUCount", perGPUCount)
+	}
+	for _, dev := range controlDevices {
+		response.Devices = append(response.Devices, &pluginapi.DeviceSpec{ContainerPath: dev, HostPath: dev, Permissions: "rw"})
+	}
+
+	klog.InfoS("Added GPU devices for MPS",
+		"resource", m.resourceName,
+		"gpuCount", len(indices),
+		"totalDevices", len(response.Devices))
 }

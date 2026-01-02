@@ -305,6 +305,11 @@ func (plugin *nvidiaDevicePlugin) GetPreferredAllocation(ctx context.Context, r 
 // Allocate returns a list of devices.
 func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	responses := pluginapi.AllocateResponse{}
+
+	// For multi-GPU MPS requests, collect all GPU IDs to merge environment variables
+	var allVisibleDevices []string
+	var allCudaDevices []string
+
 	for _, req := range reqs.ContainerRequests {
 		if err := plugin.rm.ValidateRequest(req.DevicesIds); err != nil {
 			return nil, fmt.Errorf("invalid allocation request for %q: %w", plugin.rm.Resource(), err)
@@ -313,7 +318,49 @@ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.
 		if err != nil {
 			return nil, fmt.Errorf("failed to get allocate response: %v", err)
 		}
+
+		// Collect GPU IDs for multi-GPU MPS scenarios
+		if plugin.mps.enabled {
+			if nvd, ok := response.Envs["NVIDIA_VISIBLE_DEVICES"]; ok && nvd != "" {
+				allVisibleDevices = append(allVisibleDevices, nvd)
+			}
+			if cvd, ok := response.Envs["CUDA_VISIBLE_DEVICES"]; ok && cvd != "" {
+				allCudaDevices = append(allCudaDevices, cvd)
+			}
+		}
+
 		responses.ContainerResponses = append(responses.ContainerResponses, response)
+	}
+
+	// Merge multi-GPU environment variables across all responses
+	if plugin.mps.enabled && len(responses.ContainerResponses) > 1 {
+		// Build comma-separated GPU list
+		mergedNVD := strings.Join(allVisibleDevices, ",")
+		mergedCVD := strings.Join(allCudaDevices, ",")
+
+		klog.InfoS("Merging multi-GPU MPS environment variables",
+			"gpuCount", len(responses.ContainerResponses),
+			"NVIDIA_VISIBLE_DEVICES", mergedNVD,
+			"CUDA_VISIBLE_DEVICES", mergedCVD)
+
+		// Update all responses with merged GPU list
+		// Only the first response's envs are typically used by kubelet, but update all for consistency
+		for i := range responses.ContainerResponses {
+			if mergedNVD != "" {
+				responses.ContainerResponses[i].Envs["NVIDIA_VISIBLE_DEVICES"] = mergedNVD
+			}
+			if mergedCVD != "" {
+				responses.ContainerResponses[i].Envs["CUDA_VISIBLE_DEVICES"] = mergedCVD
+			}
+			// For multi-GPU, adjust thread percentage (each GPU gets equal share)
+			if totalGPUs := len(responses.ContainerResponses); totalGPUs > 0 {
+				perGPUPercentage := 100 / totalGPUs
+				responses.ContainerResponses[i].Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", perGPUPercentage)
+				klog.InfoS("Adjusted MPS thread percentage for multi-GPU",
+					"gpuIndex", i,
+					"percentage", perGPUPercentage)
+			}
+		}
 	}
 
 	return &responses, nil
@@ -333,10 +380,15 @@ func (plugin *nvidiaDevicePlugin) getAllocateResponse(requestIds []string) (*plu
 		}
 	}
 	if plugin.mps.enabled {
-		// Pass the number of requested replicas to MPS update
+		// Pass the full annotated IDs to MPS update for token accounting and mapping
 		klog.InfoS("Calling updateResponseForMPS", "requestIds", requestIds, "deviceIDs", deviceIDs, "replicaCount", len(requestIds))
-		plugin.updateResponseForMPS(response, len(requestIds))
-		klog.InfoS("After updateResponseForMPS", "envs", response.Envs)
+		plugin.updateResponseForMPS(response, requestIds)
+		maskedEnvs := maskVisibleDeviceEnvs(response.Envs)
+		klog.InfoS("After updateResponseForMPS - envs", "envs", maskedEnvs)
+		klog.InfoS("After updateResponseForMPS - mounts", "mountCount", len(response.Mounts), "deviceCount", len(response.Devices))
+		for i, m := range response.Mounts {
+			klog.InfoS("Mount", "index", i, "containerPath", m.ContainerPath, "hostPath", m.HostPath)
+		}
 	}
 
 	// The following modifications are only made if at least one non-CDI device
@@ -358,7 +410,8 @@ func (plugin *nvidiaDevicePlugin) getAllocateResponse(requestIds []string) (*plu
 		plugin.updateResponseForDeviceMounts(response, deviceIDs...)
 	}
 	if plugin.config.Flags.Plugin.PassDeviceSpecs != nil && *plugin.config.Flags.Plugin.PassDeviceSpecs {
-		response.Devices = append(response.Devices, plugin.apiDeviceSpecs(*plugin.config.Flags.NvidiaDevRoot, requestIds)...)
+		// Use base device IDs to resolve /dev/nvidiaX paths; annotated replica IDs would not match the device map.
+		response.Devices = append(response.Devices, plugin.apiDeviceSpecs(*plugin.config.Flags.NvidiaDevRoot, deviceIDs)...)
 	}
 	if plugin.config.Flags.GDRCopyEnabled != nil && *plugin.config.Flags.GDRCopyEnabled {
 		response.Envs["NVIDIA_GDRCOPY"] = "enabled"
@@ -375,8 +428,8 @@ func (plugin *nvidiaDevicePlugin) getAllocateResponse(requestIds []string) (*plu
 // updateResponseForMPS ensures that the ContainerAllocate response contains the information required to use MPS.
 // This includes per-resource pipe and log directories as well as a global daemon-specific shm
 // and assumes that an MPS control daemon has already been started.
-func (plugin nvidiaDevicePlugin) updateResponseForMPS(response *pluginapi.ContainerAllocateResponse, replicaCount int) {
-	plugin.mps.updateReponse(response, replicaCount)
+func (plugin nvidiaDevicePlugin) updateResponseForMPS(response *pluginapi.ContainerAllocateResponse, requestIds []string) {
+	plugin.mps.updateReponse(response, requestIds)
 }
 
 // updateResponseForCDI updates the specified response for the given device IDs.
@@ -433,6 +486,33 @@ func (plugin *nvidiaDevicePlugin) getCDIDeviceAnnotations(id string, devices ...
 	}
 
 	return updatedAnnotations, nil
+}
+
+func maskVisibleDeviceEnvs(envs map[string]string) map[string]string {
+	if envs == nil {
+		return nil
+	}
+
+	masked := make(map[string]string, len(envs))
+	for k, v := range envs {
+		switch k {
+		case "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES":
+			masked[k] = maskDeviceListForLog(v)
+		default:
+			masked[k] = v
+		}
+	}
+
+	return masked
+}
+
+func maskDeviceListForLog(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "<empty>"
+	}
+
+	return fmt.Sprintf("<visible:%s>", trimmed)
 }
 
 // PreStartContainer is unimplemented for this plugin
