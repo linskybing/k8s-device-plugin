@@ -333,17 +333,25 @@ func (plugin *nvidiaDevicePlugin) getAllocateResponse(requestIds []string) (*plu
 		}
 	}
 	if plugin.mps.enabled {
-		plugin.updateResponseForMPS(response)
+		// Pass the number of requested replicas to MPS update
+		klog.InfoS("Calling updateResponseForMPS", "requestIds", requestIds, "deviceIDs", deviceIDs, "replicaCount", len(requestIds))
+		plugin.updateResponseForMPS(response, len(requestIds))
+		klog.InfoS("After updateResponseForMPS", "envs", response.Envs)
 	}
 
 	// The following modifications are only made if at least one non-CDI device
 	// list strategy is selected.
 	if plugin.deviceListStrategies.AllCDIEnabled() {
+		klog.InfoS("AllCDIEnabled, returning early")
 		return response, nil
 	}
 
-	if plugin.deviceListStrategies.Includes(spec.DeviceListStrategyEnvVar) {
+	// In MPS mode, skip updateResponseForDeviceListEnvVar because MPS already sets
+	// NVIDIA_VISIBLE_DEVICES with the correct device index (not UUID)
+	if plugin.deviceListStrategies.Includes(spec.DeviceListStrategyEnvVar) && !plugin.mps.enabled {
+		klog.InfoS("Calling updateResponseForDeviceListEnvVar", "deviceIDs", deviceIDs)
 		plugin.updateResponseForDeviceListEnvVar(response, deviceIDs...)
+		klog.InfoS("After updateResponseForDeviceListEnvVar", "envs", response.Envs)
 		plugin.updateResponseForImexChannelsEnvVar(response)
 	}
 	if plugin.deviceListStrategies.Includes(spec.DeviceListStrategyVolumeMounts) {
@@ -367,8 +375,8 @@ func (plugin *nvidiaDevicePlugin) getAllocateResponse(requestIds []string) (*plu
 // updateResponseForMPS ensures that the ContainerAllocate response contains the information required to use MPS.
 // This includes per-resource pipe and log directories as well as a global daemon-specific shm
 // and assumes that an MPS control daemon has already been started.
-func (plugin nvidiaDevicePlugin) updateResponseForMPS(response *pluginapi.ContainerAllocateResponse) {
-	plugin.mps.updateReponse(response)
+func (plugin nvidiaDevicePlugin) updateResponseForMPS(response *pluginapi.ContainerAllocateResponse, replicaCount int) {
+	plugin.mps.updateReponse(response, replicaCount)
 }
 
 // updateResponseForCDI updates the specified response for the given device IDs.

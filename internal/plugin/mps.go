@@ -104,13 +104,41 @@ func (m *mpsOptions) waitForDaemon() error {
 	return nil
 }
 
-func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse) {
+func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse, replicaCount int) {
 	if m == nil || !m.enabled {
 		return
 	}
-	// TODO: We should check that the deviceIDs are shared using MPS.
+	// Inject MPS pipe and log directories
 	for k, v := range m.daemon.EnvVars() {
 		response.Envs[k] = v
+	}
+
+	// Auto-calculate and inject CUDA_MPS_ACTIVE_THREAD_PERCENTAGE based on replica count
+	// This prevents pods from tampering with the value while allowing per-pod customization
+	if replicaCount > 0 && m.mpsConfig != nil && m.mpsConfig.Replicas > 0 {
+		// Thread percentage = (requested replicas / total replicas) * 100
+		threadPercentage := (replicaCount * 100) / int(m.mpsConfig.Replicas)
+		if threadPercentage > 100 {
+			threadPercentage = 100
+		}
+		if threadPercentage > 0 {
+			response.Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", threadPercentage)
+			klog.InfoS("Injecting MPS thread percentage based on replica request",
+				"resource", m.resourceName,
+				"requested", replicaCount,
+				"total", m.mpsConfig.Replicas,
+				"percentage", threadPercentage)
+		}
+	}
+
+	// CRITICAL: Set NVIDIA_VISIBLE_DEVICES to enable GPU access in container
+	// Without this, nvidia-container-runtime sets it to "void" which disables GPU access
+	// We use the device index (e.g., "1") to match CUDA_VISIBLE_DEVICES
+	if cvd := m.daemon.VisibleDevices(); cvd != "" {
+		response.Envs["NVIDIA_VISIBLE_DEVICES"] = cvd
+		klog.InfoS("Setting NVIDIA_VISIBLE_DEVICES to enable GPU access",
+			"resource", m.resourceName,
+			"value", cvd)
 	}
 
 	response.Mounts = append(response.Mounts,
@@ -123,4 +151,36 @@ func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse
 			HostPath:      m.hostRoot.ShmDir(m.resourceName),
 		},
 	)
+
+	// Add GPU device files so container runtime can access the hardware
+	// The device index is extracted from CUDA_VISIBLE_DEVICES
+	if cvd := m.daemon.VisibleDevices(); cvd != "" {
+		// Add main GPU device (e.g., /dev/nvidia1)
+		gpuDevice := "/dev/nvidia" + cvd
+		response.Devices = append(response.Devices, &pluginapi.DeviceSpec{
+			ContainerPath: gpuDevice,
+			HostPath:      gpuDevice,
+			Permissions:   "rw",
+		})
+
+		// Add required nvidia control devices
+		controlDevices := []string{
+			"/dev/nvidiactl",
+			"/dev/nvidia-uvm",
+			"/dev/nvidia-uvm-tools",
+			"/dev/nvidia-modeset",
+		}
+		for _, dev := range controlDevices {
+			response.Devices = append(response.Devices, &pluginapi.DeviceSpec{
+				ContainerPath: dev,
+				HostPath:      dev,
+				Permissions:   "rw",
+			})
+		}
+
+		klog.InfoS("Added GPU device specs for MPS",
+			"resource", m.resourceName,
+			"gpuDevice", gpuDevice,
+			"controlDevices", len(controlDevices))
+	}
 }

@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/opencontainers/selinux/go-selinux"
 	"k8s.io/klog/v2"
@@ -90,10 +91,29 @@ func (d *Daemon) EnvVars() envvars {
 		"CUDA_MPS_PIPE_DIRECTORY": d.PipeDir(),
 		"CUDA_MPS_LOG_DIRECTORY":  d.LogDir(),
 	}
-	if d.mpsConfig != nil && d.mpsConfig.ActiveThreadLimit > 0 {
-		env["CUDA_MPS_ACTIVE_THREAD_LIMIT"] = fmt.Sprintf("%d", d.mpsConfig.ActiveThreadLimit)
+	// Scope the server to only the devices managed by this resource; otherwise
+	// server may try device 0 even when serving gpu-1..n, leading to busy/unavailable.
+	if cvd := d.VisibleDevices(); cvd != "" {
+		env["CUDA_VISIBLE_DEVICES"] = cvd
 	}
+	// Do NOT inject CUDA_MPS_ACTIVE_THREAD_PERCENTAGE or CUDA_MPS_ACTIVE_THREAD_LIMIT
+	// Let each pod specify its own values in the pod manifest.
 	return env
+}
+
+// VisibleDevices returns a comma-separated CUDA_VISIBLE_DEVICES value scoped to this resource.
+func (d *Daemon) VisibleDevices() string {
+	// For replicated devices, we need unique GPU indices
+	seen := make(map[string]bool)
+	var ids []string
+	for _, dev := range d.Devices() {
+		// Use device index; this aligns with non-MIG per-GPU resources.
+		if !seen[dev.Index] {
+			ids = append(ids, dev.Index)
+			seen[dev.Index] = true
+		}
+	}
+	return strings.Join(ids, ",")
 }
 
 // Start starts the MPS deamon as a background process.
@@ -120,9 +140,25 @@ func (d *Daemon) Start() error {
 
 	mpsDaemon := exec.Command(mpsControlBin, "-d")
 	mpsDaemon.Env = append(mpsDaemon.Env, d.EnvVars().toSlice()...)
+	
+	// Capture stderr/stdout to help diagnose failures
+	var stderr, stdout bytes.Buffer
+	mpsDaemon.Stderr = &stderr
+	mpsDaemon.Stdout = &stdout
+	
 	if err := mpsDaemon.Run(); err != nil {
-		return err
+		klog.ErrorS(err, "Failed to start MPS daemon",
+			"resource", d.rm.Resource(),
+			"env", d.EnvVars(),
+			"stderr", stderr.String(),
+			"stdout", stdout.String())
+		return fmt.Errorf("exit code %v: %s", err, stderr.String())
 	}
+	
+	klog.InfoS("MPS daemon command completed",
+		"resource", d.rm.Resource(),
+		"stdout", stdout.String(),
+		"stderr", stderr.String())
 
 	for index, limit := range d.perDevicePinnedDeviceMemoryLimits() {
 		_, err := d.EchoPipeToControl(fmt.Sprintf("set_default_device_pinned_mem_limit %s %s", index, limit))
@@ -130,12 +166,10 @@ func (d *Daemon) Start() error {
 			return fmt.Errorf("error setting pinned memory limit for device %v: %w", index, err)
 		}
 	}
-	if threadPercentage := d.activeThreadPercentage(); threadPercentage != "" {
-		_, err := d.EchoPipeToControl(fmt.Sprintf("set_default_active_thread_percentage %s", threadPercentage))
-		if err != nil {
-			return fmt.Errorf("error setting active thread percentage: %w", err)
-		}
-	}
+	// Do NOT set default active thread percentage at server side.
+	// Let each client pod control its own thread percentage via CUDA_MPS_ACTIVE_THREAD_PERCENTAGE env var.
+	klog.InfoS("MPS daemon started without default thread percentage; clients control their own limits",
+		"resource", d.rm.Resource())
 
 	statusFile, err := os.Create(d.startedFile())
 	if err != nil {
@@ -173,8 +207,11 @@ func (d *Daemon) Stop() error {
 	}
 	klog.InfoS("Stopped MPS control daemon", "resource", d.rm.Resource())
 
-	err = d.logTailer.Stop()
-	klog.InfoS("Stopped log tailer", "resource", d.rm.Resource(), "error", err)
+	var tailErr error
+	if d.logTailer != nil {
+		tailErr = d.logTailer.Stop()
+	}
+	klog.InfoS("Stopped log tailer", "resource", d.rm.Resource(), "error", tailErr)
 
 	if err := d.setComputeMode(computeModeDefault); err != nil {
 		return fmt.Errorf("error setting compute mode %v: %w", computeModeDefault, err)
@@ -288,9 +325,28 @@ func (m *Daemon) activeThreadPercentage() string {
 	if len(m.Devices()) == 0 {
 		return ""
 	}
+	// Explicit config takes priority
 	if m.mpsConfig != nil && m.mpsConfig.ActiveThreadPercentage > 0 {
 		return fmt.Sprintf("%d", m.mpsConfig.ActiveThreadPercentage)
 	}
-	// No explicit percentage configured: leave unset so the client can decide.
+	// Auto-calculate from replicas: find the minimum replicas across all devices
+	// and use 100/replicas as the thread percentage
+	minReplicas := uint64(0)
+	replicasPerDevice := make(map[string]uint64)
+	for _, device := range m.Devices() {
+		replicasPerDevice[device.Index] += 1
+	}
+	for _, replicas := range replicasPerDevice {
+		if minReplicas == 0 || replicas < minReplicas {
+			minReplicas = replicas
+		}
+	}
+	if minReplicas > 1 {
+		percentage := 100 / minReplicas
+		klog.InfoS("Auto-calculated active thread percentage from replicas", 
+			"resource", m.rm.Resource(), "replicas", minReplicas, "percentage", percentage)
+		return fmt.Sprintf("%d", percentage)
+	}
+	// Single replica or no replicas: no thread limit
 	return ""
 }

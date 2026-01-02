@@ -76,17 +76,35 @@ func (m *manager) Daemons() ([]*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
+	klog.InfoS("Retrieved resource managers", "count", len(resourceManagers))
 	var daemons []*Daemon
 	for _, resourceManager := range resourceManagers {
+		resource := resourceManager.Resource()
+		devices := resourceManager.Devices()
+		deviceCount := len(devices)
+		
+		klog.InfoS("Checking resource manager",
+			"resource", resource,
+			"deviceCount", deviceCount,
+			"deviceIDs", devices.GetIDs())
+		
 		// We don't create daemons if there are no devices associated with the resource manager.
-		if len(resourceManager.Devices()) == 0 {
-			klog.InfoS("No devices associated with resource", "resource", resourceManager.Resource())
+		if deviceCount == 0 {
+			klog.InfoS("No devices associated with resource", "resource", resource)
 			continue
 		}
+		
 		// Check if the resources are shared.
 		// TODO: We should add a more explicit check for MPS specifically
-		if !rm.AnnotatedIDs(resourceManager.Devices().GetIDs()).AnyHasAnnotations() {
-			klog.InfoS("Resource is not shared", "resource", "resource", resourceManager.Resource())
+		annotatedIDs := rm.AnnotatedIDs(devices.GetIDs())
+		hasAnnotations := annotatedIDs.AnyHasAnnotations()
+		klog.InfoS("Checking if resource is shared",
+			"resource", resource,
+			"hasAnnotations", hasAnnotations,
+			"deviceIDs", devices.GetIDs())
+		
+		if !hasAnnotations {
+			klog.InfoS("Resource is not shared", "resource", resource)
 			continue
 		}
 		// Check if MIG devices are included.
