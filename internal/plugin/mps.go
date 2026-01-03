@@ -167,17 +167,36 @@ func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse
 		response.Envs[k] = v
 	}
 
-	// Compute thread percentage based on number of distinct GPUs allocated
-	if len(indices) > 0 {
-		perGPUPercentage := 100 / len(indices)
-		if perGPUPercentage < 1 {
-			perGPUPercentage = 1
+	// Compute thread percentage based on replica allocation ratio
+	// In MPS, percentage = (allocated_replicas / total_replicas_per_gpu) * 100
+	// For single GPU in MPS: use replica ratio; for multi-GPU: scale by number of GPUs
+	if len(indices) > 0 && len(indexQuota) > 0 {
+		replicasPerGPU := 20 // Default from config; could be overridden from m.mpsConfig if available
+		if m.mpsConfig != nil && m.mpsConfig.Replicas > 0 {
+			replicasPerGPU = m.mpsConfig.Replicas
 		}
-		response.Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", perGPUPercentage)
-		klog.InfoS("Injecting MPS thread percentage for multi-GPU",
+		
+		// If multiple GPUs, compute percentage per GPU; if single GPU, use replica ratio directly
+		var percentage int
+		if len(indices) == 1 {
+			// Single GPU: use replica allocation ratio
+			allocatedReplicas := indexQuota[indices[0]]
+			percentage = (allocatedReplicas * 100) / replicasPerGPU
+			if percentage > 100 {
+				percentage = 100 // Cap at 100%
+			}
+		} else {
+			// Multi-GPU: distribute 100% across GPUs equally
+			percentage = 100 / len(indices)
+		}
+		
+		response.Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", percentage)
+		klog.InfoS("Injecting MPS thread percentage",
 			"resource", m.resourceName,
 			"gpuCount", len(indices),
-			"percentage", perGPUPercentage)
+			"indexQuota", indexQuota,
+			"replicasPerGPU", replicasPerGPU,
+			"percentage", percentage)
 	}
 
 	// Visible devices: convert global indices to relative indices (0, 1, 2, ...)
