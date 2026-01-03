@@ -1,0 +1,175 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-gpu-matmul-test
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: cuda-test
+    image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    imagePullPolicy: IfNotPresent
+    command: ["/bin/bash", "-c"]
+    args:
+      - |
+        echo "=== Multi-GPU Matrix Multiplication Test ==="
+        echo ""
+        echo "Environment:"
+        echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-not set}"
+        echo "NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-not set}"
+        echo ""
+        nvidia-smi -L
+        echo ""
+        
+        cat > /tmp/multi_gpu_matmul.cu <<'EOFCUDA'
+        #include <cuda_runtime.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <sys/time.h>
+        
+        #define N 4096
+        #define BLOCK_SIZE 16
+        
+        __global__ void matmul(float *A, float *B, float *C, int n) {
+            int row = blockIdx.y * blockDim.y + threadIdx.y;
+            int col = blockIdx.x * blockDim.x + threadIdx.x;
+            
+            if (row < n && col < n) {
+                float sum = 0.0f;
+                for (int k = 0; k < n; k++) {
+                    sum += A[row * n + k] * B[k * n + col];
+                }
+                C[row * n + col] = sum;
+            }
+        }
+        
+        double get_time() {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            return tv.tv_sec + tv.tv_usec * 1e-6;
+        }
+        
+        int main() {
+            int deviceCount;
+            cudaGetDeviceCount(&deviceCount);
+            printf("Found %d CUDA device(s)\n\n", deviceCount);
+            
+            if (deviceCount == 0) {
+                printf("No CUDA devices found!\n");
+                return 1;
+            }
+            
+            size_t bytes = N * N * sizeof(float);
+            printf("Matrix size: %dx%d (%.2f MB per matrix)\n", N, N, bytes / 1024.0 / 1024.0);
+            printf("Total memory needed: %.2f MB\n\n", 3 * bytes / 1024.0 / 1024.0);
+            
+            // Test each GPU
+            for (int dev = 0; dev < deviceCount; dev++) {
+                cudaSetDevice(dev);
+                
+                cudaDeviceProp prop;
+                cudaGetDeviceProperties(&prop, dev);
+                printf("========================================\n");
+                printf("Testing GPU %d: %s\n", dev, prop.name);
+                printf("Compute capability: %d.%d\n", prop.major, prop.minor);
+                printf("Total memory: %.2f GB\n", prop.totalGlobalMem / 1024.0 / 1024.0 / 1024.0);
+                printf("========================================\n");
+                
+                // Allocate host memory
+                float *h_A = (float*)malloc(bytes);
+                float *h_B = (float*)malloc(bytes);
+                float *h_C = (float*)malloc(bytes);
+                
+                // Initialize matrices
+                for (int i = 0; i < N * N; i++) {
+                    h_A[i] = 1.0f;
+                    h_B[i] = 2.0f;
+                }
+                
+                // Allocate device memory
+                float *d_A, *d_B, *d_C;
+                cudaMalloc(&d_A, bytes);
+                cudaMalloc(&d_B, bytes);
+                cudaMalloc(&d_C, bytes);
+                
+                // Copy to device
+                double start = get_time();
+                cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
+                cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
+                double copy_time = get_time() - start;
+                
+                // Launch kernel
+                dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
+                dim3 dimGrid((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
+                
+                start = get_time();
+                matmul<<<dimGrid, dimBlock>>>(d_A, d_B, d_C, N);
+                cudaDeviceSynchronize();
+                double kernel_time = get_time() - start;
+                
+                // Copy result back
+                start = get_time();
+                cudaMemcpy(h_C, d_C, bytes, cudaMemcpyDeviceToHost);
+                double copyback_time = get_time() - start;
+                
+                // Verify result
+                int errors = 0;
+                float expected = N * 1.0f * 2.0f;
+                for (int i = 0; i < 10 && i < N * N; i++) {
+                    if (fabs(h_C[i] - expected) > 1e-3) {
+                        errors++;
+                        if (errors <= 5) {
+                            printf("Error at index %d: expected %.2f, got %.2f\n", i, expected, h_C[i]);
+                        }
+                    }
+                }
+                
+                printf("\nResults:\n");
+                printf("  Copy to device:   %.3f ms\n", copy_time * 1000);
+                printf("  Kernel execution: %.3f ms\n", kernel_time * 1000);
+                printf("  Copy to host:     %.3f ms\n", copyback_time * 1000);
+                printf("  Total time:       %.3f ms\n", (copy_time + kernel_time + copyback_time) * 1000);
+                
+                double gflops = (2.0 * N * N * N) / kernel_time / 1e9;
+                printf("  Performance:      %.2f GFLOPS\n", gflops);
+                
+                if (errors == 0) {
+                    printf("  Verification:     PASSED ✓\n");
+                } else {
+                    printf("  Verification:     FAILED ✗ (%d errors)\n", errors);
+                }
+                printf("\n");
+                
+                // Cleanup
+                cudaFree(d_A);
+                cudaFree(d_B);
+                cudaFree(d_C);
+                free(h_A);
+                free(h_B);
+                free(h_C);
+            }
+            
+            printf("========================================\n");
+            printf("Multi-GPU test completed!\n");
+            return 0;
+        }
+        EOFCUDA
+        
+        echo "Compiling CUDA program..."
+        nvcc -O3 /tmp/multi_gpu_matmul.cu -o /tmp/multi_gpu_matmul
+        
+        if [ $? -eq 0 ]; then
+            echo "Running multi-GPU matrix multiplication test..."
+            echo ""
+            /tmp/multi_gpu_matmul
+        else
+            echo "Compilation failed!"
+            exit 1
+        fi
+    resources:
+      limits:
+        nvidia.com/gpu: "35"
+    securityContext:
+      allowPrivilegeEscalation: false
+  nodeSelector:
+    kubernetes.io/hostname: gpu1

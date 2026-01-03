@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mps-multigpu-limited
+  labels:
+    test: mps-multi
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: gpu1
+  containers:
+  - name: cuda-test
+    image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    resources:
+      limits:
+        nvidia.com/gpu: 5
+    command: ["/bin/bash", "-c"]
+    args:
+      - |
+        echo "=== [LIMITED 5 replicas - single GPU] Multi-GPU Matrix Multiply ==="
+        echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-not set}"
+        echo "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE: ${CUDA_MPS_ACTIVE_THREAD_PERCENTAGE:-not set}"
+        echo "MPS_GPU_QUOTA: ${MPS_GPU_QUOTA:-not set}"
+        echo ""
+        nvidia-smi -L
+        echo ""
+        cat > /tmp/multi_gpu_matmul.cu << 'CUDA_CODE'
+        #include <cuda_runtime.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <sys/time.h>
+        #define N 4096
+        #define BLOCK_SIZE 16
+        __global__ void matmul(float *A, float *B, float *C, int n) {
+            int row = blockIdx.y * blockDim.y + threadIdx.y;
+            int col = blockIdx.x * blockDim.x + threadIdx.x;
+            if (row < n && col < n) {
+                float sum = 0.0f;
+                for (int k = 0; k < n; k++) {
+                    sum += A[row * n + k] * B[k * n + col];
+                }
+                C[row * n + col] = sum;
+            }
+        }
+        double get_time() {
+            struct timeval tv; gettimeofday(&tv, NULL); return tv.tv_sec + tv.tv_usec * 1e-6;
+        }
+        int main() {
+            int deviceCount; cudaGetDeviceCount(&deviceCount);
+            printf("Found %d CUDA device(s)\n\n", deviceCount);
+            if (deviceCount == 0) return 1;
+            size_t bytes = N * N * sizeof(float);
+            double total_time = 0.0;
+            for (int dev = 0; dev < deviceCount; dev++) {
+                cudaSetDevice(dev);
+                float *h_A=(float*)malloc(bytes), *h_B=(float*)malloc(bytes), *h_C=(float*)malloc(bytes);
+                for (int i=0;i<N*N;i++){h_A[i]=1.0f; h_B[i]=2.0f;}
+                float *d_A,*d_B,*d_C; cudaMalloc(&d_A,bytes); cudaMalloc(&d_B,bytes); cudaMalloc(&d_C,bytes);
+                double start=get_time(); cudaMemcpy(d_A,h_A,bytes,cudaMemcpyHostToDevice); cudaMemcpy(d_B,h_B,bytes,cudaMemcpyHostToDevice); double copy_time=get_time()-start;
+                dim3 dimBlock(BLOCK_SIZE,BLOCK_SIZE); dim3 dimGrid((N+BLOCK_SIZE-1)/BLOCK_SIZE,(N+BLOCK_SIZE-1)/BLOCK_SIZE);
+                start=get_time(); matmul<<<dimGrid,dimBlock>>>(d_A,d_B,d_C,N); cudaDeviceSynchronize(); double kernel_time=get_time()-start;
+                start=get_time(); cudaMemcpy(h_C,d_C,bytes,cudaMemcpyDeviceToHost); double copyback_time=get_time()-start;
+                float expected = N * 1.0f * 2.0f; int errors=0; for(int i=0;i<10 && i<N*N;i++){ if (fabsf(h_C[i]-expected)>1e-3){errors++; if(errors<=5) printf("Err %d exp %.2f got %.2f\n",i,expected,h_C[i]);}}
+                double gflops = (2.0 * N * N * N) / kernel_time / 1e9;
+                printf("GPU %d: CopyH2D %.3f ms, Kernel %.3f ms, D2H %.3f ms, GFLOPS %.2f, Status %s\n", dev, copy_time*1000, kernel_time*1000, copyback_time*1000, gflops, errors?"FAIL":"PASS");
+                total_time += kernel_time;
+                cudaFree(d_A); cudaFree(d_B); cudaFree(d_C); free(h_A); free(h_B); free(h_C);
+            }
+            printf("\nTotal Kernel Time: %.3f ms\n", total_time * 1000);
+            return 0;
+        }
+        CUDA_CODE
+        nvcc -O3 /tmp/multi_gpu_matmul.cu -o /tmp/multi_gpu_matmul && time /tmp/multi_gpu_matmul
