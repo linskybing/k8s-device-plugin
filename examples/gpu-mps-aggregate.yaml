@@ -1,0 +1,16 @@
+version: v1
+flags:
+  migStrategy: none
+resources:
+  gpus:
+    - pattern: "*"
+      name: gpu-mps              # exposes nvidia.com/gpu-mps
+sharing:
+  mps:
+    renameByDefault: false
+    failRequestsGreaterThanOne: false
+    resources:
+      - name: nvidia.com/gpu-mps
+        replicas: 25             # per-GPU token count; 4 GPUs -> 100 tokens total
+        devices:
+          all: true

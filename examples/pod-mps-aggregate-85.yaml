@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mps-aggregate-85
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: nvidia/cuda:12.4.1-base-ubuntu22.04
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          echo "Env:"; env | grep -E 'CUDA_VISIBLE|NVIDIA_VISIBLE|GPU_DEVICE_MAP';
+          echo "Devices:"; ls -l /dev/nvidia*;
+          echo "nvidia-smi:"; nvidia-smi --query-gpu=index,uuid,name,memory.total --format=csv
+          sleep 300
+      resources:
+        requests:
+          nvidia.com/gpu-mps: 85
+        limits:
+          nvidia.com/gpu-mps: 85
+      volumeMounts:
+        - name: mps-root
+          mountPath: /run/nvidia/mps
+  volumes:
+    - name: mps-root
+      hostPath:
+        path: /run/nvidia/mps
+        type: Directory

@@ -54,10 +54,11 @@ func (r *resourceManager) distributedAlloc(available, required []string, size in
 	// Grab the set of 'needed' devices one-by-one from the candidates list.
 	// Before selecting each candidate, first sort the candidate list using the
 	// replicas map above. After sorting, the first element in the list will
-	// contain the device with the least difference between total and available
-	// replications (based on what's already been allocated). Add this device
-	// to the list of devices to allocate, remove it from the candidate list,
-	// down its available count in the replicas map, and repeat.
+	// contain the device with the MOST difference between total and available
+	// replications (based on what's already been allocated) - PACK strategy.
+	// This ensures we fill up GPUs completely before moving to the next one.
+	// Add this device to the list of devices to allocate, remove it from the
+	// candidate list, down its available count in the replicas map, and repeat.
 	var devices []string
 	for i := 0; i < needed; i++ {
 		sort.Slice(candidates, func(i, j int) bool {
@@ -65,7 +66,13 @@ func (r *resourceManager) distributedAlloc(available, required []string, size in
 			jid := AnnotatedID(candidates[j]).GetID()
 			idiff := replicas[iid].total - replicas[iid].available
 			jdiff := replicas[jid].total - replicas[jid].available
-			return idiff < jdiff
+			// Pack strategy: prefer GPUs with MORE allocated replicas (higher diff)
+			// This fills up GPUs sequentially instead of spreading across all GPUs
+			if idiff != jdiff {
+				return idiff > jdiff
+			}
+			// Tie-breaker: use GPU ID for stable sorting
+			return iid < jid
 		})
 		id := AnnotatedID(candidates[0]).GetID()
 		replicas[id].available--

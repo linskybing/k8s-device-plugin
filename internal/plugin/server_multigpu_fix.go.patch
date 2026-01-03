@@ -1,0 +1,64 @@
+--- a/internal/plugin/server.go
++++ b/internal/plugin/server.go
+@@ -305,13 +305,57 @@ func (plugin *nvidiaDevicePlugin) allocateHelper(devices plugin.Interface, requ
+ // Allocate returns a list of devices.
+ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
+ 	responses := pluginapi.AllocateResponse{}
++	
++	// For multi-GPU MPS requests, we need to merge environment variables
++	// Otherwise each GPU's env vars will overwrite the previous ones
++	var allVisibleDevices []string
++	var allCudaDevices []string
++	
+ 	for _, req := range reqs.ContainerRequests {
+ 		if err := plugin.rm.ValidateRequest(req.DevicesIds); err != nil {
+ 			return nil, fmt.Errorf("invalid allocation request for %q: %w", plugin.rm.Resource(), err)
+ 		}
+ 		response, err := plugin.getAllocateResponse(req.DevicesIds)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to get allocate response: %v", err)
+ 		}
++		
++		// Collect GPU IDs for multi-GPU MPS scenarios
++		if plugin.mps.enabled {
++			if nvd, ok := response.Envs["NVIDIA_VISIBLE_DEVICES"]; ok && nvd != "" {
++				allVisibleDevices = append(allVisibleDevices, nvd)
++			}
++			if cvd, ok := response.Envs["CUDA_VISIBLE_DEVICES"]; ok && cvd != "" {
++				allCudaDevices = append(allCudaDevices, cvd)
++			}
++		}
++		
+ 		responses.ContainerResponses = append(responses.ContainerResponses, response)
+ 	}
++	
++	// Merge multi-GPU environment variables across all responses
++	if plugin.mps.enabled && len(responses.ContainerResponses) > 1 {
++		// Build comma-separated GPU list
++		mergedNVD := strings.Join(allVisibleDevices, ",")
++		mergedCVD := strings.Join(allCudaDevices, ",")
++		
++		klog.InfoS("Merging multi-GPU MPS environment variables",
++			"gpuCount", len(responses.ContainerResponses),
++			"NVIDIA_VISIBLE_DEVICES", mergedNVD,
++			"CUDA_VISIBLE_DEVICES", mergedCVD)
++		
++		// Update all responses with merged GPU list
++		// Only the first response's envs are used by kubelet, but update all for consistency
++		for i := range responses.ContainerResponses {
++			if mergedNVD != "" {
++				responses.ContainerResponses[i].Envs["NVIDIA_VISIBLE_DEVICES"] = mergedNVD
++			}
++			if mergedCVD != "" {
++				responses.ContainerResponses[i].Envs["CUDA_VISIBLE_DEVICES"] = mergedCVD
++			}
++			// For multi-GPU, each gets equal share
++			if totalReplicas := len(responses.ContainerResponses); totalReplicas > 0 {
++				perGPUPercentage := 100 / totalReplicas
++				responses.ContainerResponses[i].Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", perGPUPercentage)
++			}
++		}
++	}
+
+ 	return &responses, nil
+ }

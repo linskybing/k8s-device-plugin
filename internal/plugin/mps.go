@@ -180,14 +180,20 @@ func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse
 			"percentage", perGPUPercentage)
 	}
 
-	// Visible devices scoped to the indices chosen
-	merged := strings.Join(indices, ",")
-	if merged != "" {
-		response.Envs["NVIDIA_VISIBLE_DEVICES"] = merged
-		response.Envs["CUDA_VISIBLE_DEVICES"] = merged
-		klog.InfoS("Setting merged visible devices",
+	// Visible devices: convert global indices to relative indices (0, 1, 2, ...)
+	// CUDA expects relative positions within the visible set, not absolute GPU indices
+	var relativeIndices []string
+	for i := range indices {
+		relativeIndices = append(relativeIndices, fmt.Sprintf("%d", i))
+	}
+	relativeMerged := strings.Join(relativeIndices, ",")
+	if relativeMerged != "" {
+		response.Envs["NVIDIA_VISIBLE_DEVICES"] = relativeMerged
+		response.Envs["CUDA_VISIBLE_DEVICES"] = relativeMerged
+		klog.InfoS("Setting merged visible devices (relative indices)",
 			"resource", m.resourceName,
-			"value", merged)
+			"value", relativeMerged,
+			"globalIndices", strings.Join(indices, ","))
 	}
 
 	if len(indexQuota) > 0 {
