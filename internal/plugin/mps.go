@@ -167,36 +167,39 @@ func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse
 		response.Envs[k] = v
 	}
 
-	// Compute thread percentage based on replica allocation ratio
-	// In MPS, percentage = (allocated_replicas / total_replicas_per_gpu) * 100
-	// For single GPU in MPS: use replica ratio; for multi-GPU: scale by number of GPUs
+	// Compute thread percentage based on per-GPU replica allocation ratio
+	// Each GPU has a maximum of replicasPerGPU available replicas
+	// Use the minimum ratio across all GPUs as the global CUDA_MPS_ACTIVE_THREAD_PERCENTAGE
+	// This ensures no GPU exceeds its allocated quota
 	if len(indices) > 0 && len(indexQuota) > 0 {
 		replicasPerGPU := 20 // Default from config; could be overridden from m.mpsConfig if available
 		if m.mpsConfig != nil && m.mpsConfig.Replicas > 0 {
 			replicasPerGPU = m.mpsConfig.Replicas
 		}
 		
-		// If multiple GPUs, compute percentage per GPU; if single GPU, use replica ratio directly
-		var percentage int
-		if len(indices) == 1 {
-			// Single GPU: use replica allocation ratio
-			allocatedReplicas := indexQuota[indices[0]]
-			percentage = (allocatedReplicas * 100) / replicasPerGPU
-			if percentage > 100 {
-				percentage = 100 // Cap at 100%
+		// Calculate per-GPU quota ratios and use the minimum
+		var minRatio int = 100
+		gpuRatios := make(map[string]int)
+		for _, idx := range indices {
+			allocatedReplicas := indexQuota[idx]
+			ratio := (allocatedReplicas * 100) / replicasPerGPU
+			if ratio > 100 {
+				ratio = 100
 			}
-		} else {
-			// Multi-GPU: distribute 100% across GPUs equally
-			percentage = 100 / len(indices)
+			gpuRatios[idx] = ratio
+			if ratio < minRatio {
+				minRatio = ratio
+			}
 		}
 		
-		response.Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", percentage)
-		klog.InfoS("Injecting MPS thread percentage",
+		response.Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", minRatio)
+		klog.InfoS("Injecting MPS thread percentage based on per-GPU quota",
 			"resource", m.resourceName,
 			"gpuCount", len(indices),
 			"indexQuota", indexQuota,
+			"gpuRatios", gpuRatios,
 			"replicasPerGPU", replicasPerGPU,
-			"percentage", percentage)
+			"globalThreadPercentage", minRatio)
 	}
 
 	// Visible devices: convert global indices to relative indices (0, 1, 2, ...)
