@@ -565,8 +565,16 @@ func (plugin *nvidiaDevicePlugin) apiDevices() []*pluginapi.Device {
 }
 
 // updateResponseForDeviceListEnvVar sets the environment variable for the requested devices.
+// Using relative indices (0, 1, 2...) instead of actual GPU IDs for better portability
 func (plugin *nvidiaDevicePlugin) updateResponseForDeviceListEnvVar(response *pluginapi.ContainerAllocateResponse, deviceIDs ...string) {
-	response.Envs[deviceListEnvVar] = strings.Join(deviceIDs, ",")
+	// Convert device IDs to relative indices
+	relativeIndices := make([]string, len(deviceIDs))
+	for i := range deviceIDs {
+		relativeIndices[i] = fmt.Sprintf("%d", i)
+	}
+	response.Envs[deviceListEnvVar] = strings.Join(relativeIndices, ",")
+	// Also set CUDA_VISIBLE_DEVICES for compatibility
+	response.Envs["CUDA_VISIBLE_DEVICES"] = strings.Join(relativeIndices, ",")
 }
 
 // updateResponseForImexChannelsEnvVar sets the environment variable for the requested IMEX channels.
