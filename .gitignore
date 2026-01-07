@@ -7,5 +7,8 @@ deployments/helm/gpu-feature-discovery
 cmd/gpu-feature-discovery/gfd-test-loop
 e2e_logs
 
+# Ignore local mps-dra deployment drafts and checkpoints
+deployments/mps-dra/
+
 *.out
 *.log
