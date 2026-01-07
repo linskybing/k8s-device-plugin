@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -157,3 +158,47 @@ func devicesToIndices(devices []string) []int {
 	}
 	return out
 }
+
+// Score implements framework.ScorePlugin. It scores nodes for pods that
+// requested MPS (via annotations). The score is the average remaining percent
+// across the top-N devices on the node (0-100). If the node cannot satisfy the
+// request or status cannot be retrieved, score 0 is returned to avoid blocking
+// scheduling.
+func (pl *GPUMPSPlugin) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int, *framework.Status) {
+	v, err := state.Read(framework.StateKey(gpuRequestStateKey))
+	if err != nil {
+		return 0, framework.NewStatus(framework.Success)
+	}
+	req := v.(*GPURequest)
+
+	// fetch per-device remaining percents (overrideable in tests)
+	m, err := GetDeviceRemaining(nodeName)
+	if err != nil {
+		return 0, framework.NewStatus(framework.Success)
+	}
+	if len(m) < int(req.NumCards) {
+		return 0, framework.NewStatus(framework.Success)
+	}
+
+	var rems []int
+	for _, r := range m {
+		rems = append(rems, r)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(rems)))
+
+	// average top-N
+	sum := 0
+	for i := 0; i < int(req.NumCards); i++ {
+		sum += rems[i]
+	}
+	avg := sum / int(req.NumCards)
+	if avg > 100 {
+		avg = 100
+	} else if avg < 0 {
+		avg = 0
+	}
+	return avg, framework.NewStatus(framework.Success)
+}
+
+// ScoreExtensions returns nil (no normalization implemented).
+func (pl *GPUMPSPlugin) ScoreExtensions() framework.ScoreExtensions { return nil }
