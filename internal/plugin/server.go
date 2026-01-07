@@ -18,13 +18,16 @@ package plugin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
@@ -66,6 +69,14 @@ type nvidiaDevicePlugin struct {
 	imexChannels imex.Channels
 
 	mps mpsOptions
+
+	// status server for exposing per-device remaining percent (0-100)
+	statusMux       sync.RWMutex
+	deviceRemaining map[string]int
+	statusSock      string
+	// allocations tracks per-pod reservations: podKey -> deviceID -> percent
+	allocationsMux sync.RWMutex
+	allocations    map[string]map[string]int
 }
 
 // devicePluginForResource creates a device plugin for the specified resource.
@@ -109,6 +120,9 @@ func (plugin *nvidiaDevicePlugin) initialize() {
 	plugin.server = grpc.NewServer([]grpc.ServerOption{}...)
 	plugin.health = make(chan *rm.Device)
 	plugin.stop = make(chan interface{})
+	plugin.deviceRemaining = make(map[string]int)
+	plugin.statusSock = plugin.socket + ".status"
+	plugin.allocations = make(map[string]map[string]int)
 }
 
 func (plugin *nvidiaDevicePlugin) cleanup() {
@@ -116,6 +130,9 @@ func (plugin *nvidiaDevicePlugin) cleanup() {
 	plugin.server = nil
 	plugin.health = nil
 	plugin.stop = nil
+	plugin.deviceRemaining = nil
+	plugin.statusSock = ""
+	plugin.allocations = nil
 }
 
 // Devices returns the full set of devices associated with the plugin.
@@ -163,10 +180,22 @@ func (plugin *nvidiaDevicePlugin) Stop() error {
 	if plugin == nil || plugin.server == nil {
 		return nil
 	}
-	klog.Infof("Stopping to serve '%s' on %s", plugin.rm.Resource(), plugin.socket)
+	var resName string
+	if plugin.rm != nil {
+		// safe call when rm is initialized
+		resName = string(plugin.rm.Resource())
+	} else {
+		resName = "<unknown>"
+	}
+	klog.Infof("Stopping to serve '%s' on %s", resName, plugin.socket)
 	plugin.server.Stop()
 	if err := os.Remove(plugin.socket); err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	if plugin.statusSock != "" {
+		if err := os.Remove(plugin.statusSock); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	plugin.cleanup()
 	return nil
@@ -178,6 +207,47 @@ func (plugin *nvidiaDevicePlugin) Serve() error {
 	sock, err := net.Listen("unix", plugin.socket)
 	if err != nil {
 		return err
+	}
+
+	// Start a small HTTP unix-socket server exposing per-device remaining percent.
+	// This is intentionally minimal: values default to 100 and will be updated
+	// later when allocation logic tracks MPS usage.
+	if plugin.statusSock != "" {
+		// remove any previous socket
+		_ = os.Remove(plugin.statusSock)
+		statusListener, err := net.Listen("unix", plugin.statusSock)
+		if err != nil {
+			klog.Warningf("Failed to start status listener for '%s' on %s: %v", plugin.rm.Resource(), plugin.statusSock, err)
+		} else {
+			// initialize deviceRemaining for known devices
+			plugin.statusMux.Lock()
+			for _, d := range plugin.apiDevices() {
+				if _, ok := plugin.deviceRemaining[d.ID]; !ok {
+					plugin.deviceRemaining[d.ID] = 100
+				}
+			}
+			plugin.statusMux.Unlock()
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/status", plugin.statusHandler)
+			mux.HandleFunc("/reserve", plugin.reserveHandler)
+			mux.HandleFunc("/unreserve", plugin.unreserveHandler)
+
+			go func() {
+				klog.Infof("Starting status HTTP server for '%s' on %s", plugin.rm.Resource(), plugin.statusSock)
+				// Serve will block until the listener is closed.
+				if err := http.Serve(statusListener, mux); err != nil {
+					klog.Infof("Status server for '%s' stopped: %v", plugin.rm.Resource(), err)
+				}
+			}()
+
+			// ensure the status listener is closed when plugin.stop is closed
+			go func() {
+				<-plugin.stop
+				_ = statusListener.Close()
+				_ = os.Remove(plugin.statusSock)
+			}()
+		}
 	}
 
 	pluginapi.RegisterDevicePluginServer(plugin.server, plugin)
@@ -360,6 +430,14 @@ func (plugin *nvidiaDevicePlugin) getAllocateResponse(requestIds []string) (*plu
 	if plugin.config.Flags.MOFEDEnabled != nil && *plugin.config.Flags.MOFEDEnabled {
 		response.Envs["NVIDIA_MOFED"] = "enabled"
 	}
+	// NOTE: Allocation accounting should be performed by the scheduler via
+	// /reserve and finalized by Allocate() using recorded reservations.
+	// The previous placeholder decrement was removed to avoid double-counting
+	// and to rely on scheduler-driven reservations.
+
+	// Consume any recorded reservation matching these device IDs so that
+	// the node-local bookkeeping does not double-count.
+	plugin.consumeReservationForDeviceIDs(deviceIDs)
 	return response, nil
 }
 
@@ -368,6 +446,41 @@ func (plugin *nvidiaDevicePlugin) getAllocateResponse(requestIds []string) (*plu
 // and assumes that an MPS control daemon has already been started.
 func (plugin nvidiaDevicePlugin) updateResponseForMPS(response *pluginapi.ContainerAllocateResponse) {
 	plugin.mps.updateReponse(response)
+}
+
+// consumeReservationForDeviceIDs finds a pod-local reservation that covers
+// all requested device IDs and finalizes it by removing the reserved
+// entries for those devices. Returns the podKey consumed or empty string
+// if none matched.
+func (plugin *nvidiaDevicePlugin) consumeReservationForDeviceIDs(deviceIDs []string) string {
+	plugin.statusMux.Lock()
+	plugin.allocationsMux.Lock()
+	defer plugin.allocationsMux.Unlock()
+	defer plugin.statusMux.Unlock()
+
+	for podKey, allocMap := range plugin.allocations {
+		match := true
+		for _, id := range deviceIDs {
+			if allocMap[id] <= 0 {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		for _, id := range deviceIDs {
+			delete(allocMap, id)
+		}
+		if len(allocMap) == 0 {
+			delete(plugin.allocations, podKey)
+		} else {
+			plugin.allocations[podKey] = allocMap
+		}
+		klog.InfoS("Allocate: finalized reservation", "pod", podKey, "devices", deviceIDs)
+		return podKey
+	}
+	return ""
 }
 
 // updateResponseForCDI updates the specified response for the given device IDs.
@@ -552,4 +665,117 @@ func (plugin *nvidiaDevicePlugin) apiDeviceSpecs(devRoot string, ids []string) [
 	}
 
 	return specs
+}
+
+// statusHandler returns a JSON map of deviceID -> remainingPercent.
+// English comment: minimal HTTP handler for node-local status queries.
+func (plugin *nvidiaDevicePlugin) statusHandler(w http.ResponseWriter, r *http.Request) {
+	plugin.statusMux.RLock()
+	resp := make(map[string]int, len(plugin.deviceRemaining))
+	for k, v := range plugin.deviceRemaining {
+		resp[k] = v
+	}
+	plugin.statusMux.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// reserveHandler accepts reservations from the scheduler and records allocations.
+// Request JSON: {"podKey":"ns/name","devices":["deviceID"],"percent":50}
+func (plugin *nvidiaDevicePlugin) reserveHandler(w http.ResponseWriter, r *http.Request) {
+	type reserveReq struct {
+		PodKey  string   `json:"podKey"`
+		Devices []string `json:"devices"`
+		Percent int      `json:"percent"`
+	}
+	var req reserveReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	if req.PodKey == "" || len(req.Devices) == 0 || req.Percent <= 0 {
+		http.Error(w, "invalid reservation", http.StatusBadRequest)
+		return
+	}
+
+	// Apply reservation: decrement remaining percent per device atomically and record allocation.
+	plugin.statusMux.Lock()
+	plugin.allocationsMux.Lock()
+	defer plugin.allocationsMux.Unlock()
+	defer plugin.statusMux.Unlock()
+
+	allocMap, ok := plugin.allocations[req.PodKey]
+	if !ok {
+		allocMap = make(map[string]int)
+		plugin.allocations[req.PodKey] = allocMap
+	}
+
+	for _, id := range req.Devices {
+		cur, ok := plugin.deviceRemaining[id]
+		if !ok {
+			cur = 100
+		}
+		dec := req.Percent
+		if dec < 0 {
+			dec = 0
+		}
+		// cap decrement so we don't go below 0
+		if dec > cur {
+			dec = cur
+		}
+		cur -= dec
+		plugin.deviceRemaining[id] = cur
+
+		// record what we actually reserved for this pod on this device
+		prev := allocMap[id]
+		allocMap[id] = prev + dec
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// unreserveHandler releases previously recorded allocations for a pod.
+// Request JSON: {"podKey":"ns/name"}
+func (plugin *nvidiaDevicePlugin) unreserveHandler(w http.ResponseWriter, r *http.Request) {
+	type unreserveReq struct {
+		PodKey string `json:"podKey"`
+	}
+	var req unreserveReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.PodKey == "" {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch and remove allocations for this pod, then add percentages back to deviceRemaining.
+	plugin.allocationsMux.Lock()
+	allocMap, ok := plugin.allocations[req.PodKey]
+	if !ok {
+		plugin.allocationsMux.Unlock()
+		// nothing to do
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
+	delete(plugin.allocations, req.PodKey)
+	plugin.allocationsMux.Unlock()
+
+	plugin.statusMux.Lock()
+	for id, percent := range allocMap {
+		cur := plugin.deviceRemaining[id]
+		cur += percent
+		if cur > 100 {
+			cur = 100
+		}
+		plugin.deviceRemaining[id] = cur
+	}
+	plugin.statusMux.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
