@@ -73,26 +73,12 @@ func (pl *GPUMPSPlugin) Reserve(ctx context.Context, state *framework.CycleState
 	req := v.(*GPURequest)
 	podKey := pod.Namespace + "/" + pod.Name
 
-	// Minimal global reservation step: record reservation in CapacityManager
-	if err := capacityMgr.Reserve(podKey, nodeName, int(req.NumCards), int(req.PercentPerCard)); err != nil {
-		klog.InfoS("Reserve: CapacityManager.Reserve failed", "pod", podKey, "node", nodeName, "err", err)
-		return framework.NewStatus(framework.Unschedulable, "capacity manager rejected reservation")
-	}
-
-	// Query node-local device plugin status to pick devices
-	devices, err := pickDevicesFromNode(nodeName, int(req.NumCards), int(req.PercentPerCard))
+	// Delegate core logic to ReserveLogic (testable helper).
+	devices, err := ReserveLogic(ctx, pod.Namespace+"/"+pod.Name, *req, nodeName, pickDevicesFromNode, ReserveForPod)
 	if err != nil {
-		klog.InfoS("Reserve: failed to pick devices", "node", nodeName, "err", err)
-		// rollback CapacityManager reservation
-		_ = capacityMgr.Release(podKey, nodeName)
-		return framework.NewStatus(framework.Unschedulable, "cannot find suitable GPU capacity")
-	}
-
-	if err := ReserveForPod(ctx, nodeName, podKey, devices, int(req.PercentPerCard)); err != nil {
-		klog.InfoS("Reserve: ReserveForPod failed", "pod", podKey, "node", nodeName, "err", err)
-		// rollback CapacityManager reservation
-		_ = capacityMgr.Release(podKey, nodeName)
-		return framework.NewStatus(framework.Error, "reserve failed")
+		// Map ReserveLogic errors to scheduler statuses.
+		klog.InfoS("Reserve: ReserveLogic failed", "pod", podKey, "node", nodeName, "err", err)
+		return framework.NewStatus(framework.Unschedulable, "reserve failed")
 	}
 
 	// store allocation info for later stages
@@ -116,12 +102,25 @@ func (pl *GPUMPSPlugin) Unreserve(ctx context.Context, state *framework.CycleSta
 
 // PostBind: optional sync; no-op for minimal integration.
 func (pl *GPUMPSPlugin) PostBind(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) {
+	// After the pod is bound, finalize the cluster-side reservation by
+	// releasing it from the CapacityManager. This keeps the reservation
+	// lifecycle symmetric: Reserve() -> CapacityManager.Reserve(), and
+	// PostBind() -> CapacityManager.Release() when the pod has been bound.
+	if state == nil {
+		return
+	}
+	v, err := state.Read(framework.StateKey(podReservationStateKey))
+	if err != nil {
+		return
+	}
+	podKey := v.(string)
+	releaseCapacityReservation(podKey, nodeName)
 }
 
 // pickDevicesFromNode queries the node-local status socket and returns up to numCards deviceIDs with remaining >= percent.
 func pickDevicesFromNode(nodeName string, numCards, percent int) ([]string, error) {
 	// For minimal implementation assume status socket path is standard and accessible.
-	statusSock := "/var/lib/kubelet/device-plugins/nvidia-gpu.sock.status"
+	statusSock := statusSocketPath(nodeName)
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "unix", statusSock)
 	}}

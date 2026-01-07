@@ -10,12 +10,18 @@ import (
 	"time"
 )
 
+// statusSocketPath returns the filesystem path for a node's device-plugin
+// status unix socket. Tests may override this to point to temporary sockets.
+var statusSocketPath = func(nodeName string) string {
+	return "/var/lib/kubelet/device-plugins/nvidia-gpu.sock.status"
+}
+
 // ReserveOnNode calls the node-local device plugin status socket to reserve
 // percent-based capacity for a pod on the specified devices.
 // It expects the device plugin status socket to be available via a hostPath
 // (e.g. mounted into the scheduler pod) at /var/lib/kubelet/device-plugins/nvidia-gpu.sock.status.
 func ReserveOnNode(ctx context.Context, nodeName, podKey string, devices []string, percent int) error {
-	statusSock := "/var/lib/kubelet/device-plugins/nvidia-gpu.sock.status"
+	statusSock := statusSocketPath(nodeName)
 
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -50,7 +56,7 @@ func ReserveOnNode(ctx context.Context, nodeName, podKey string, devices []strin
 // UnreserveOnNode releases a previous reservation for podKey on the node-local
 // device plugin status socket.
 func UnreserveOnNode(ctx context.Context, nodeName, podKey string) error {
-	statusSock := "/var/lib/kubelet/device-plugins/nvidia-gpu.sock.status"
+	statusSock := statusSocketPath(nodeName)
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", statusSock)
