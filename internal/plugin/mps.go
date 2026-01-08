@@ -178,7 +178,7 @@ func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse
 		if m.mpsConfig != nil && m.mpsConfig.Replicas > 0 {
 			replicasPerGPU = m.mpsConfig.Replicas
 		}
-		
+
 		// Calculate per-GPU quota ratios and use the minimum
 		var minRatio int = 100
 		gpuRatios := make(map[string]int)
@@ -193,7 +193,7 @@ func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse
 				minRatio = ratio
 			}
 		}
-		
+
 		response.Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", minRatio)
 		klog.InfoS("Injecting MPS thread percentage based on per-GPU quota",
 			"resource", m.resourceName,
