@@ -334,9 +334,32 @@ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.
 
 	// Merge multi-GPU environment variables across all responses
 	if plugin.mps.enabled && len(responses.ContainerResponses) > 1 {
-		// Build comma-separated GPU list
-		mergedNVD := strings.Join(allVisibleDevices, ",")
-		mergedCVD := strings.Join(allCudaDevices, ",")
+		// Build union of global GPU indices from annotations set by MPS daemon
+		seen := make(map[string]bool)
+		var globalIndices []string
+		for _, assigned := range allVisibleDevices {
+			// assigned may be a comma-separated list of global indices (from annotation)
+			for _, s := range strings.Split(assigned, ",") {
+				s = strings.TrimSpace(s)
+				if s == "" {
+					continue
+				}
+				if !seen[s] {
+					seen[s] = true
+					globalIndices = append(globalIndices, s)
+				}
+			}
+		}
+		sort.Strings(globalIndices)
+
+		// merged visible devices should be relative indices 0..N-1 for the union
+		var mergedRel []string
+		for i := range globalIndices {
+			mergedRel = append(mergedRel, fmt.Sprintf("%d", i))
+		}
+		mergedNVD := strings.Join(mergedRel, ",")
+		// For CUDA_VISIBLE_DEVICES keep same as NVIDIA_VISIBLE_DEVICES
+		mergedCVD := mergedNVD
 
 		klog.InfoS("Merging multi-GPU MPS environment variables",
 			"gpuCount", len(responses.ContainerResponses),
@@ -352,13 +375,14 @@ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.
 			if mergedCVD != "" {
 				responses.ContainerResponses[i].Envs["CUDA_VISIBLE_DEVICES"] = mergedCVD
 			}
-			// For multi-GPU, adjust thread percentage (each GPU gets equal share)
-			if totalGPUs := len(responses.ContainerResponses); totalGPUs > 0 {
+			// For multi-GPU, adjust thread percentage based on number of unique GPUs
+			if totalGPUs := len(globalIndices); totalGPUs > 0 {
 				perGPUPercentage := 100 / totalGPUs
 				responses.ContainerResponses[i].Envs["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = fmt.Sprintf("%d", perGPUPercentage)
 				klog.InfoS("Adjusted MPS thread percentage for multi-GPU",
 					"gpuIndex", i,
-					"percentage", perGPUPercentage)
+					"percentage", perGPUPercentage,
+					"globalIndices", strings.Join(globalIndices, ","))
 			}
 		}
 	}
