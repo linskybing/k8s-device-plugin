@@ -322,9 +322,18 @@ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.
 
 		// Collect GPU IDs for multi-GPU MPS scenarios
 		if plugin.mps.enabled {
-			if nvd, ok := response.Envs["NVIDIA_VISIBLE_DEVICES"]; ok && nvd != "" {
+			// Prefer global indices exposed via MPS annotations (set by updateReponseForMPS).
+			// Fallback to environment variables if annotation not present.
+			if response.Annotations != nil {
+				if ann, ok := response.Annotations["mps.nvidia.com/assigned-gpus"]; ok && ann != "" {
+					allVisibleDevices = append(allVisibleDevices, ann)
+				} else if nvd, ok := response.Envs["NVIDIA_VISIBLE_DEVICES"]; ok && nvd != "" {
+					allVisibleDevices = append(allVisibleDevices, nvd)
+				}
+			} else if nvd, ok := response.Envs["NVIDIA_VISIBLE_DEVICES"]; ok && nvd != "" {
 				allVisibleDevices = append(allVisibleDevices, nvd)
 			}
+
 			if cvd, ok := response.Envs["CUDA_VISIBLE_DEVICES"]; ok && cvd != "" {
 				allCudaDevices = append(allCudaDevices, cvd)
 			}
@@ -408,6 +417,37 @@ func (plugin *nvidiaDevicePlugin) getAllocateResponse(requestIds []string) (*plu
 		// Pass the full annotated IDs to MPS update for token accounting and mapping
 		klog.InfoS("Calling updateResponseForMPS", "requestIds", requestIds, "deviceIDs", deviceIDs, "replicaCount", len(requestIds))
 		plugin.updateResponseForMPS(response, requestIds)
+
+		// Ensure the container sees only the relative indices for the devices actually
+		// allocated to this container. Some runtimes or daemon envs can expose
+		// additional GPUs unless we explicitly set the visible device envs and
+		// device specs to the subset belonging to this allocation.
+		n := len(deviceIDs)
+		if n > 0 {
+			var rel []string
+			for i := 0; i < n; i++ {
+				rel = append(rel, fmt.Sprintf("%d", i))
+			}
+			relList := strings.Join(rel, ",")
+			// Override/ensure both env vars use relative indices 0..N-1
+			response.Envs[deviceListEnvVar] = relList
+			response.Envs["CUDA_VISIBLE_DEVICES"] = relList
+
+			// Rebuild response.Devices so only the assigned /dev/nvidiaX nodes are exposed
+			// Map unique device IDs -> host indices and produce device specs
+			indices := plugin.rm.Devices().Subset(deviceIDs).GetIndices()
+			var devSpecs []*pluginapi.DeviceSpec
+			for _, idx := range indices {
+				p := "/dev/nvidia" + idx
+				devSpecs = append(devSpecs, &pluginapi.DeviceSpec{ContainerPath: p, HostPath: p, Permissions: "rw"})
+			}
+			// Add control devices
+			controlDevices := []string{"/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools", "/dev/nvidia-modeset"}
+			for _, p := range controlDevices {
+				devSpecs = append(devSpecs, &pluginapi.DeviceSpec{ContainerPath: p, HostPath: p, Permissions: "rw"})
+			}
+			response.Devices = devSpecs
+		}
 		maskedEnvs := maskVisibleDeviceEnvs(response.Envs)
 		klog.InfoS("After updateResponseForMPS - envs", "envs", maskedEnvs)
 		klog.InfoS("After updateResponseForMPS - mounts", "mountCount", len(response.Mounts), "deviceCount", len(response.Devices))

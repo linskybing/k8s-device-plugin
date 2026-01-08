@@ -81,9 +81,11 @@ func (r *resourceManager) ValidateRequest(ids AnnotatedIDs) error {
 			return fmt.Errorf("%w: maximum request size for shared resources is 1; found %d", errInvalidRequest, numRequestedDevices)
 		}
 	case spec.SharingStrategyMPS:
-		if includesReplicas && numRequestedDevices > 1 && r.config.Sharing.ReplicatedResources().FailRequestsGreaterThanOne {
-			return fmt.Errorf("%w: maximum request size for shared resources is 1; found %d", errInvalidRequest, numRequestedDevices)
-		}
+		// For MPS sharing, requests that include replicas MUST not span more than
+		// one underlying GPU. This is independent of the FailRequestsGreaterThanOne flag.
+		// if includesReplicas && numRequestedDevices > 1 {
+		// 	return fmt.Errorf("%w: maximum request size for MPS shared resources is 1; found %d", errInvalidRequest, numRequestedDevices)
+		// }
 	}
 	return nil
 }

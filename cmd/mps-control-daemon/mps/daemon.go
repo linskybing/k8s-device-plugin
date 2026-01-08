@@ -93,9 +93,12 @@ func (d *Daemon) EnvVars() envvars {
 	}
 	// Scope the server to only the devices managed by this resource; otherwise
 	// server may try device 0 even when serving gpu-1..n, leading to busy/unavailable.
-	if cvd := d.VisibleDevices(); cvd != "" {
-		env["CUDA_VISIBLE_DEVICES"] = cvd
-	}
+	// NOTE: Do not inject CUDA_VISIBLE_DEVICES here. The device plugin will
+	// set the correct per-container CUDA_VISIBLE_DEVICES (relative indices)
+	// based on the allocation. Injecting daemon-level CUDA_VISIBLE_DEVICES
+	// can cause containers to see the full daemon device list instead of the
+	// per-allocation relative indices (bug: containers showing other GPUs
+	// via nvidia-smi). Leave daemon envs limited to MPS directories only.
 	// Do NOT inject CUDA_MPS_ACTIVE_THREAD_PERCENTAGE or CUDA_MPS_ACTIVE_THREAD_LIMIT
 	// Let each pod specify its own values in the pod manifest.
 	return env
@@ -140,12 +143,12 @@ func (d *Daemon) Start() error {
 
 	mpsDaemon := exec.Command(mpsControlBin, "-d")
 	mpsDaemon.Env = append(mpsDaemon.Env, d.EnvVars().toSlice()...)
-	
+
 	// Capture stderr/stdout to help diagnose failures
 	var stderr, stdout bytes.Buffer
 	mpsDaemon.Stderr = &stderr
 	mpsDaemon.Stdout = &stdout
-	
+
 	if err := mpsDaemon.Run(); err != nil {
 		klog.ErrorS(err, "Failed to start MPS daemon",
 			"resource", d.rm.Resource(),
@@ -154,7 +157,7 @@ func (d *Daemon) Start() error {
 			"stdout", stdout.String())
 		return fmt.Errorf("exit code %v: %s", err, stderr.String())
 	}
-	
+
 	klog.InfoS("MPS daemon command completed",
 		"resource", d.rm.Resource(),
 		"stdout", stdout.String(),
@@ -343,7 +346,7 @@ func (m *Daemon) activeThreadPercentage() string {
 	}
 	if minReplicas > 1 {
 		percentage := 100 / minReplicas
-		klog.InfoS("Auto-calculated active thread percentage from replicas", 
+		klog.InfoS("Auto-calculated active thread percentage from replicas",
 			"resource", m.rm.Resource(), "replicas", minReplicas, "percentage", percentage)
 		return fmt.Sprintf("%d", percentage)
 	}
