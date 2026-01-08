@@ -163,8 +163,10 @@ func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse
 	if response.Envs == nil {
 		response.Envs = make(map[string]string)
 	}
-	for k, v := range m.daemon.EnvVars() {
-		response.Envs[k] = v
+	if m.daemon != nil {
+		for k, v := range m.daemon.EnvVars() {
+			response.Envs[k] = v
+		}
 	}
 
 	// Compute thread percentage based on per-GPU replica allocation ratio
@@ -241,10 +243,12 @@ func (m *mpsOptions) updateReponse(response *pluginapi.ContainerAllocateResponse
 	}
 
 	// Mounts: pipe and shm (shared across all GPUs in this resource)
-	response.Mounts = append(response.Mounts,
-		&pluginapi.Mount{ContainerPath: m.daemon.PipeDir(), HostPath: m.hostRoot.PipeDir(m.resourceName)},
-		&pluginapi.Mount{ContainerPath: m.daemon.ShmDir(), HostPath: m.hostRoot.ShmDir(m.resourceName)},
-	)
+	if m.daemon != nil {
+		response.Mounts = append(response.Mounts,
+			&pluginapi.Mount{ContainerPath: m.daemon.PipeDir(), HostPath: m.hostRoot.PipeDir(m.resourceName)},
+			&pluginapi.Mount{ContainerPath: m.daemon.ShmDir(), HostPath: m.hostRoot.ShmDir(m.resourceName)},
+		)
+	}
 
 	// Add GPU device files for all selected indices
 	controlDevices := []string{"/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools", "/dev/nvidia-modeset"}

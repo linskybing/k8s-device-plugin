@@ -110,8 +110,10 @@ func (r *nvmlResourceManager) getPreferredAllocation(available, required []strin
 		return r.alignedAlloc(available, required, size)
 	}
 
-	// Otherwise, distribute them evenly across all replicated GPUs
-	return r.distributedAlloc(available, required, size)
+	// Otherwise, use capacity-aware allocation to prefer single-card allocations
+	// and minimize fragmentation. Falls back to best-effort if full request
+	// cannot be satisfied.
+	return r.capacityAwareAlloc(available, required, size)
 }
 
 // alignedAlloc shells out to the alignedAllocationPolicy that is set in

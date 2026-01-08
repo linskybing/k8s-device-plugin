@@ -85,3 +85,167 @@ func (r *resourceManager) distributedAlloc(available, required []string, size in
 
 	return devices, nil
 }
+
+// capacityAwareAlloc allocates up to `size` devices (including `required`) while
+// ensuring no single physical GPU (baseID) is assigned more than its capacity
+// (Device.Replicas). Uses a minimum-fit / best-fit strategy to reduce fragmentation:
+// 1) prefer a single base that can fully satisfy the remaining need with minimal leftover,
+// 2) otherwise iteratively choose the base that, when allocated, leaves the smallest remaining capacity.
+func (r *resourceManager) capacityAwareAlloc(available, required []string, size int) ([]string, error) {
+	candidates := r.devices.Subset(available).Difference(r.devices.Subset(required)).GetIDs()
+	needed := size - len(required)
+
+	if needed <= 0 {
+		return required, nil
+	}
+	if len(candidates) == 0 {
+		return required, nil
+	}
+
+	// Group available annotated IDs by baseID.
+	groups := make(map[string][]string)
+	for _, c := range candidates {
+		base := AnnotatedID(c).GetID()
+		groups[base] = append(groups[base], c)
+	}
+
+	// Compute per-base capacity (Device.Replicas when present, default 1).
+	capacity := make(map[string]int)
+	for base := range groups {
+		capacity[base] = 1
+		for id, dev := range r.devices {
+			if AnnotatedID(id).GetID() == base {
+				if dev.Replicas > 1 {
+					capacity[base] = dev.Replicas
+				} else {
+					capacity[base] = 1
+				}
+				break
+			}
+		}
+	}
+
+	// Count already required per base (so we don't exceed capacity including required).
+	reqCount := make(map[string]int)
+	for _, id := range required {
+		base := AnnotatedID(id).GetID()
+		reqCount[base]++
+	}
+
+	// Compute total allocatable slots across all bases; if zero, nothing can be
+	// allocated (even partially) and we should return an error to prevent
+	// kubelet from accepting a useless suggestion.
+	totalAllocatable := 0
+	for base, list := range groups {
+		remCap := capacity[base] - reqCount[base]
+		if remCap <= 0 {
+			continue
+		}
+		alloc := len(list)
+		if alloc > remCap {
+			alloc = remCap
+		}
+		if alloc > 0 {
+			totalAllocatable += alloc
+		}
+	}
+	if totalAllocatable == 0 {
+		return nil, fmt.Errorf("unable to allocate any devices to satisfy request")
+	}
+
+	// 1) Try to find a single base that can fully satisfy `needed` with minimal leftover.
+	var bestBase string
+	var bestLeftover int = -1
+	for base, list := range groups {
+		avail := len(list)
+		remainingCap := capacity[base] - reqCount[base]
+		if remainingCap <= 0 {
+			continue
+		}
+		maxAlloc := avail
+		if maxAlloc > remainingCap {
+			maxAlloc = remainingCap
+		}
+		if maxAlloc >= needed {
+			leftover := maxAlloc - needed
+			if bestLeftover == -1 || leftover < bestLeftover || (leftover == bestLeftover && base < bestBase) {
+				bestLeftover = leftover
+				bestBase = base
+			}
+		}
+	}
+	if bestBase != "" {
+		selected := groups[bestBase][:needed]
+		return append(required, selected...), nil
+	}
+
+	// 2) Iterative best-fit: pick base that minimizes leftover capacity after allocating
+	remaining := needed
+	selected := []string{}
+
+	// ensure deterministic order within each group's candidate list
+	for base := range groups {
+		sort.Strings(groups[base])
+	}
+
+	used := make(map[string]int)
+	for b, v := range reqCount {
+		used[b] = v
+	}
+
+	for remaining > 0 {
+		type cand struct {
+			base           string
+			alloc          int
+			leftoverAfter  int
+			availableSlots int
+		}
+		var cands []cand
+		for base, list := range groups {
+			avail := len(list)
+			if avail == 0 {
+				continue
+			}
+			remCap := capacity[base] - used[base]
+			if remCap <= 0 {
+				continue
+			}
+			alloc := avail
+			if alloc > remCap {
+				alloc = remCap
+			}
+			if alloc > remaining {
+				alloc = remaining
+			}
+			if alloc <= 0 {
+				continue
+			}
+			leftover := (capacity[base] - used[base]) - alloc
+			cands = append(cands, cand{base: base, alloc: alloc, leftoverAfter: leftover, availableSlots: avail})
+		}
+		if len(cands) == 0 {
+			// nothing more allocatable -> best-effort return
+			break
+		}
+		// choose candidate with minimal leftoverAfter; tie-break by larger alloc, then baseID
+		sort.Slice(cands, func(i, j int) bool {
+			if cands[i].leftoverAfter != cands[j].leftoverAfter {
+				return cands[i].leftoverAfter < cands[j].leftoverAfter
+			}
+			if cands[i].alloc != cands[j].alloc {
+				return cands[i].alloc > cands[j].alloc
+			}
+			return cands[i].base < cands[j].base
+		})
+		chosen := cands[0]
+		take := chosen.alloc
+		// append from groups[base] the first `take` annotated IDs
+		selected = append(selected, groups[chosen.base][:take]...)
+		// remove taken IDs from group's front
+		groups[chosen.base] = groups[chosen.base][take:]
+		used[chosen.base] += take
+		remaining -= take
+	}
+
+	return append(required, selected...), nil
+}
