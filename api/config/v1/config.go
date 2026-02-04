@@ -125,11 +125,11 @@ func parseConfigFrom(reader io.Reader) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal error: %v", err)
 	}
-	
+
 	// Debug: Log raw YAML and parsed MPS config
 	if config.Sharing.MPS != nil {
 		klog.InfoS("Raw YAML MPS section", "yaml", string(configYaml[strings.Index(string(configYaml), "sharing:"):]))
-		klog.InfoS("Parsed MPS config from YAML", 
+		klog.InfoS("Parsed MPS config from YAML",
 			"enableMemoryLimit", config.Sharing.MPS.EnableMemoryLimit,
 			"renameByDefault", config.Sharing.MPS.RenameByDefault,
 			"resourceCount", len(config.Sharing.MPS.Resources))
