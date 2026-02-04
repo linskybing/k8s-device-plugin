@@ -13,6 +13,7 @@
       - [Notes on `CRI-O` configuration](#notes-on-cri-o-configuration)
   - [Enabling GPU Support in Kubernetes](#enabling-gpu-support-in-kubernetes)
   - [Running GPU Jobs](#running-gpu-jobs)
+- [MPS Setup Guide](#mps-setup-guide)
 - [Configuring the NVIDIA device plugin binary](#configuring-the-nvidia-device-plugin-binary)
   - [As command line flags or envvars](#as-command-line-flags-or-envvars)
   - [As a configuration file](#as-a-configuration-file)
@@ -201,6 +202,12 @@ Done
 
 > [!WARNING]
 > If you do not request GPUs when you use the device plugin, the plugin exposes all the GPUs on the machine inside your container.
+
+## MPS Setup Guide
+
+This repository includes an MPS configuration and deployment workflow. Use the guide below for MPS setup, aggregate and individual modes, and verification steps:
+
+[MPS Setup Guide](MPS_SETUP_GUIDE.md)
 
 ## Configuring the NVIDIA device plugin binary
 

@@ -82,18 +82,18 @@ func (m *manager) Daemons() ([]*Daemon, error) {
 		resource := resourceManager.Resource()
 		devices := resourceManager.Devices()
 		deviceCount := len(devices)
-		
+
 		klog.InfoS("Checking resource manager",
 			"resource", resource,
 			"deviceCount", deviceCount,
 			"deviceIDs", devices.GetIDs())
-		
+
 		// We don't create daemons if there are no devices associated with the resource manager.
 		if deviceCount == 0 {
 			klog.InfoS("No devices associated with resource", "resource", resource)
 			continue
 		}
-		
+
 		// Check if the resources are shared.
 		// TODO: We should add a more explicit check for MPS specifically
 		annotatedIDs := rm.AnnotatedIDs(devices.GetIDs())
@@ -102,7 +102,7 @@ func (m *manager) Daemons() ([]*Daemon, error) {
 			"resource", resource,
 			"hasAnnotations", hasAnnotations,
 			"deviceIDs", devices.GetIDs())
-		
+
 		if !hasAnnotations {
 			klog.InfoS("Resource is not shared", "resource", resource)
 			continue
@@ -125,6 +125,20 @@ func (m *manager) Daemons() ([]*Daemon, error) {
 		if mpsCfg != nil && !mpsCfg.Enabled {
 			mpsCfg = nil
 		}
+
+		// For aggregate mode, create a synthetic MPS config from sharing configuration
+		if mpsCfg == nil && m.config.Sharing.MPS != nil {
+			klog.InfoS("Creating synthetic MPS config from sharing settings",
+				"sharingMPS.EnableMemoryLimit", m.config.Sharing.MPS.EnableMemoryLimit,
+				"sharingMPS.RenameByDefault", m.config.Sharing.MPS.RenameByDefault)
+			mpsCfg = &spec.GPUMPSConfig{
+				Enabled:           true,
+				EnableMemoryLimit: m.config.Sharing.MPS.EnableMemoryLimit,
+			}
+			klog.InfoS("Created synthetic MPS config from sharing settings",
+				"enableMemoryLimit", m.config.Sharing.MPS.EnableMemoryLimit)
+		}
+
 		daemon := NewDaemon(resourceManager, ContainerRoot, mpsCfg)
 		daemons = append(daemons, daemon)
 	}

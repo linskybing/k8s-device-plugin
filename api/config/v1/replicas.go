@@ -31,6 +31,10 @@ type ReplicatedResources struct {
 	RenameByDefault            bool                 `json:"renameByDefault,omitempty"            yaml:"renameByDefault,omitempty"`
 	FailRequestsGreaterThanOne bool                 `json:"failRequestsGreaterThanOne,omitempty" yaml:"failRequestsGreaterThanOne,omitempty"`
 	Resources                  []ReplicatedResource `json:"resources,omitempty"                  yaml:"resources,omitempty"`
+	// EnableMemoryLimit controls whether to enforce proportional memory allocation for MPS
+	// When false (default): Each replica can use full GPU memory
+	// When true: Memory is divided proportionally based on replica count
+	EnableMemoryLimit bool `json:"enableMemoryLimit,omitempty"          yaml:"enableMemoryLimit,omitempty"`
 }
 
 func (rrs *ReplicatedResources) disableResoureRenaming(id string) {

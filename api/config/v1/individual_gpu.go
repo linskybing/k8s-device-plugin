@@ -57,6 +57,10 @@ type GPUMPSConfig struct {
 	// Replicas defines how many replicas to create for MPS sharing
 	// Default is 1 (no sharing)
 	Replicas int `json:"replicas,omitempty" yaml:"replicas,omitempty"`
+	// EnableMemoryLimit controls whether to enforce proportional memory allocation
+	// When false (default): Each replica can use full GPU memory (no limit)
+	// When true: Memory is divided proportionally based on replica count
+	EnableMemoryLimit bool `json:"enableMemoryLimit,omitempty" yaml:"enableMemoryLimit,omitempty"`
 }
 
 // GetResourceName returns the resource name for the GPU config

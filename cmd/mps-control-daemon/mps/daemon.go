@@ -61,11 +61,23 @@ type Daemon struct {
 
 // NewDaemon creates an MPS daemon instance.
 func NewDaemon(rm rm.ResourceManager, root Root, cfg *spec.GPUMPSConfig) *Daemon {
-	return &Daemon{
+	d := &Daemon{
 		rm:        rm,
 		root:      root,
 		mpsConfig: cfg,
 	}
+	if cfg != nil {
+		klog.InfoS("MPS Daemon initialized with config",
+			"enabled", cfg.Enabled,
+			"enableMemoryLimit", cfg.EnableMemoryLimit,
+			"replicas", cfg.Replicas,
+			"activeThreadLimit", cfg.ActiveThreadLimit,
+			"activeThreadPercentage", cfg.ActiveThreadPercentage,
+			"pinnedMemoryLimit", cfg.PinnedMemoryLimit)
+	} else {
+		klog.InfoS("MPS Daemon initialized with no config")
+	}
+	return d
 }
 
 // Devices returns the list of devices under the control of this MPS daemon.
@@ -149,8 +161,24 @@ func (d *Daemon) Start() error {
 	mpsDaemon.Stderr = &stderr
 	mpsDaemon.Stdout = &stdout
 
-	if err := mpsDaemon.Run(); err != nil {
+	// Start the daemon process
+	if err := mpsDaemon.Start(); err != nil {
 		klog.ErrorS(err, "Failed to start MPS daemon",
+			"resource", d.rm.Resource(),
+			"env", d.EnvVars())
+		return fmt.Errorf("failed to start MPS daemon: %w", err)
+	}
+
+	// Ensure process cleanup on failure
+	defer func() {
+		if mpsDaemon.Process != nil {
+			_ = mpsDaemon.Process.Release()
+		}
+	}()
+
+	// Wait for the daemon to complete its initialization
+	if err := mpsDaemon.Wait(); err != nil {
+		klog.ErrorS(err, "MPS daemon process failed",
 			"resource", d.rm.Resource(),
 			"env", d.EnvVars(),
 			"stderr", stderr.String(),
@@ -204,32 +232,64 @@ func setSELinuxContext(path string, context string) error {
 
 // Stop ensures that the MPS daemon is quit.
 func (d *Daemon) Stop() error {
+	// First, try graceful shutdown via quit command
 	_, err := d.EchoPipeToControl("quit")
 	if err != nil {
-		return fmt.Errorf("error sending quit message: %w", err)
+		klog.ErrorS(err, "Error sending quit message, will force cleanup", "resource", d.rm.Resource())
+		// If quit fails, we still need to clean up
+	} else {
+		klog.InfoS("Stopped MPS control daemon", "resource", d.rm.Resource())
 	}
-	klog.InfoS("Stopped MPS control daemon", "resource", d.rm.Resource())
 
+	// Stop the log tailer
 	var tailErr error
 	if d.logTailer != nil {
 		tailErr = d.logTailer.Stop()
 	}
 	klog.InfoS("Stopped log tailer", "resource", d.rm.Resource(), "error", tailErr)
 
+	// Force cleanup of any remaining MPS processes
+	// This prevents zombie processes from lingering
+	d.forceCleanupMPSProcesses()
+
+	// Reset compute mode
 	if err := d.setComputeMode(computeModeDefault); err != nil {
 		return fmt.Errorf("error setting compute mode %v: %w", computeModeDefault, err)
 	}
 
-	if err := os.Remove(d.startedFile()); err != nil && err != os.ErrNotExist {
+	// Remove status files
+	if err := os.Remove(d.startedFile()); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove started file: %w", err)
 	}
 
+	// Clean up directories
 	logDir := d.LogDir()
 	if err := os.RemoveAll(logDir); err != nil {
-		klog.ErrorS(err, "Failed to remove pipe directory", "path", logDir)
+		klog.ErrorS(err, "Failed to remove log directory", "path", logDir)
+	}
+
+	pipeDir := d.PipeDir()
+	if err := os.RemoveAll(pipeDir); err != nil {
+		klog.ErrorS(err, "Failed to remove pipe directory", "path", pipeDir)
 	}
 
 	return nil
+}
+
+// forceCleanupMPSProcesses kills any remaining MPS processes for this daemon.
+// This is a safety measure to prevent zombie processes.
+func (d *Daemon) forceCleanupMPSProcesses() {
+	// Use pkill to kill processes using our pipe directory
+	// This ensures we don't kill other MPS daemons
+	pipeDir := d.PipeDir()
+
+	klog.InfoS("Force cleaning up MPS processes", "resource", d.rm.Resource(), "pipeDir", pipeDir)
+
+	// pkill will fail if no processes found, which is fine
+	cmd := exec.Command("pkill", "-f", pipeDir)
+	if err := cmd.Run(); err != nil {
+		klog.V(4).InfoS("pkill did not find processes to kill (this is normal)", "resource", d.rm.Resource(), "error", err)
+	}
 }
 
 func (d *Daemon) LogDir() string {
@@ -271,7 +331,19 @@ func (d *Daemon) EchoPipeToControl(command string) (string, error) {
 		return "", fmt.Errorf("failed to start NVIDIA MPS command: %w", err)
 	}
 
+	// Ensure the process is always cleaned up, even if Wait() fails
+	defer func() {
+		if mpsDaemon.Process != nil {
+			// Try to wait for the process first
+			_ = mpsDaemon.Process.Release()
+		}
+	}()
+
 	if _, err := writer.Write([]byte(command)); err != nil {
+		// Kill the process if write fails to prevent zombie
+		if mpsDaemon.Process != nil {
+			_ = mpsDaemon.Process.Kill()
+		}
 		return "", fmt.Errorf("failed to write message to pipe: %w", err)
 	}
 	_ = writer.Close()
@@ -298,7 +370,25 @@ func (d *Daemon) setComputeMode(mode computeMode) error {
 }
 
 // perDevicePinnedMemoryLimits returns the pinned memory limits for each device.
+//
+// Memory limit behavior is controlled by the EnableMemoryLimit flag:
+//   - When EnableMemoryLimit=false (default): No memory limits are set,
+//     allowing each replica to use the full GPU memory (32GB).
+//   - When EnableMemoryLimit=true: The limit is set to TOTAL GPU memory,
+//     enabling proportional allocation:
+//   - Request 20 replicas = get 32GB (full GPU)
+//   - Request 10 replicas = get 16GB (half GPU)
+//   - Request 1 replica = get 1.6GB (1/20 of GPU)
+//
+// The MPS scheduler will manage actual memory allocation based on replica count.
 func (m *Daemon) perDevicePinnedDeviceMemoryLimits() map[string]string {
+	// Check if memory limit enforcement is disabled
+	if m.mpsConfig != nil && !m.mpsConfig.EnableMemoryLimit {
+		klog.InfoS("Memory limit enforcement disabled - each replica can use full GPU memory",
+			"enableMemoryLimit", false)
+		return make(map[string]string)
+	}
+
 	totalMemoryInBytesPerDevice := make(map[string]uint64)
 	replicasPerDevice := make(map[string]uint64)
 	for _, device := range m.Devices() {
@@ -312,14 +402,31 @@ func (m *Daemon) perDevicePinnedDeviceMemoryLimits() map[string]string {
 		if totalMemory == 0 {
 			continue
 		}
-		// If a pinned memory limit is explicitly set in config, apply it per device
+
+		replicas := replicasPerDevice[index]
+		totalMemoryMiB := totalMemory / 1024 / 1024
+
+		// If a pinned memory limit is explicitly set in config, use it
 		if m.mpsConfig != nil && m.mpsConfig.PinnedMemoryLimit > 0 {
-			limits[index] = fmt.Sprintf("%dM", m.mpsConfig.PinnedMemoryLimit)
+			configLimitMiB := uint64(m.mpsConfig.PinnedMemoryLimit)
+			limits[index] = fmt.Sprintf("%dM", configLimitMiB)
+			klog.InfoS("Using configured pinned memory limit (allows proportional allocation)",
+				"device", index,
+				"total_memory_gb", float64(totalMemory)/1024/1024/1024,
+				"replicas", replicas,
+				"limit_mib", configLimitMiB)
 			continue
 		}
 
-		replicas := replicasPerDevice[index]
-		limits[index] = fmt.Sprintf("%vM", totalMemory/replicas/1024/1024)
+		// Set limit to TOTAL memory, not divided by replicas
+		// This allows MPS clients to use memory proportional to their replica count
+		limits[index] = fmt.Sprintf("%vM", totalMemoryMiB)
+		klog.InfoS("Set device pinned memory limit to TOTAL (proportional allocation enabled)",
+			"device", index,
+			"total_memory_gb", float64(totalMemory)/1024/1024/1024,
+			"replicas", replicas,
+			"limit_per_device_mib", totalMemoryMiB,
+			"expected_per_replica_mib", totalMemoryMiB/uint64(replicas))
 	}
 	return limits
 }

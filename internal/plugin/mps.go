@@ -66,6 +66,14 @@ func (o *options) getMPSOptions(resourceManager rm.ResourceManager) (mpsOptions,
 		mpsCfg = nil
 	}
 
+	// For aggregate mode, create a synthetic MPS config from sharing configuration
+	if sharingEnabled && mpsCfg == nil && o.config.Sharing.MPS != nil {
+		mpsCfg = &spec.GPUMPSConfig{
+			Enabled:           true,
+			EnableMemoryLimit: o.config.Sharing.MPS.EnableMemoryLimit,
+		}
+	}
+
 	m := mpsOptions{
 		enabled:      true,
 		resourceName: resourceManager.Resource(),
