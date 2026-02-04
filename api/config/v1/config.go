@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	cli "github.com/urfave/cli/v2"
 	"k8s.io/klog/v2"
@@ -123,6 +124,15 @@ func parseConfigFrom(reader io.Reader) (*Config, error) {
 	err = yaml.Unmarshal(configYaml, &config)
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal error: %v", err)
+	}
+	
+	// Debug: Log raw YAML and parsed MPS config
+	if config.Sharing.MPS != nil {
+		klog.InfoS("Raw YAML MPS section", "yaml", string(configYaml[strings.Index(string(configYaml), "sharing:"):]))
+		klog.InfoS("Parsed MPS config from YAML", 
+			"enableMemoryLimit", config.Sharing.MPS.EnableMemoryLimit,
+			"renameByDefault", config.Sharing.MPS.RenameByDefault,
+			"resourceCount", len(config.Sharing.MPS.Resources))
 	}
 
 	if config.Version == "" {
