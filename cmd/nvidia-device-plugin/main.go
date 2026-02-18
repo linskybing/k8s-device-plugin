@@ -150,6 +150,18 @@ func main() {
 			Usage:   "the strategy to use to discover devices: 'auto', 'nvml', or 'tegra'",
 			EnvVars: []string{"DEVICE_DISCOVERY_STRATEGY"},
 		},
+		&cli.BoolFlag{
+			Name:    "named-resources",
+			Value:   false,
+			Usage:   "enable per-GPU resource naming (e.g., nvidia.com/gpu-0, nvidia.com/gpu-1, ...)",
+			EnvVars: []string{"NAMED_RESOURCES"},
+		},
+		&cli.BoolFlag{
+			Name:    "mps-memory-limiting",
+			Value:   false,
+			Usage:   "enable strict VRAM limiting for MPS (e.g., 500m request limits to 50% VRAM)",
+			EnvVars: []string{"MPS_MEMORY_LIMITING"},
+		},
 		&cli.IntSliceFlag{
 			Name:    "imex-channel-ids",
 			Usage:   "A list of IMEX channels to inject.",
@@ -334,7 +346,7 @@ func startPlugins(c *cli.Context, o *options) ([]plugin.Interface, bool, error) 
 	if err != nil {
 		return nil, false, fmt.Errorf("unable to load config: %v", err)
 	}
-	spec.DisableResourceNamingInConfig(config)
+	// spec.DisableResourceNamingInConfig(config)
 
 	driverRoot := root(*config.Flags.Plugin.ContainerDriverRoot)
 	// We construct an NVML library specifying the path to libnvidia-ml.so.1

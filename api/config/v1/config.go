@@ -73,7 +73,8 @@ func NewConfig(c *cli.Context, flags []cli.Flag) (*Config, error) {
 	// This can be relaxed in certain cases -- such as a single GPU -- but
 	// requires additional logic around when it's OK to combine requests and
 	// makes the semantics of a request unclear.
-	if config.Sharing.MPS != nil {
+	// For milli-GPU support, we allow this to be false.
+	if config.Sharing.MPS != nil && !config.Sharing.MPS.isReplicated() {
 		config.Sharing.MPS.FailRequestsGreaterThanOne = true
 	}
 

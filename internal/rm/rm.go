@@ -81,14 +81,9 @@ func (r *resourceManager) ValidateRequest(ids AnnotatedIDs) error {
 			return fmt.Errorf("%w: maximum request size for shared resources is 1; found %d", errInvalidRequest, numRequestedDevices)
 		}
 	case spec.SharingStrategyMPS:
-		// For MPS sharing, we explicitly ignore the FailRequestsGreaterThanOne
-		// value in the sharing settings.
-		// This setting was added to timeslicing after the initial release and
-		// is set to `false` to maintain backward compatibility with existing
-		// deployments. If we do extend MPS to allow multiple devices to be
-		// requested, the MPS API will be extended separately from the
-		// time-slicing API.
-		if includesReplicas && numRequestedDevices > 1 {
+		// For MPS sharing, we allow multiple devices to be requested to
+		// support milli-GPU requests (e.g., 700m).
+		if includesReplicas && numRequestedDevices > 1 && r.config.Sharing.ReplicatedResources().FailRequestsGreaterThanOne {
 			return fmt.Errorf("%w: maximum request size for shared resources is 1; found %d", errInvalidRequest, numRequestedDevices)
 		}
 	}
@@ -97,7 +92,14 @@ func (r *resourceManager) ValidateRequest(ids AnnotatedIDs) error {
 
 // AddDefaultResourcesToConfig adds default resource matching rules to config.Resources
 func AddDefaultResourcesToConfig(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, config *spec.Config) error {
-	_ = config.Resources.AddGPUResource("*", "gpu")
+	if config.Flags.NamedResources != nil && *config.Flags.NamedResources {
+		for i := 0; i < 32; i++ {
+			_ = config.Resources.AddGPUResource(fmt.Sprintf("%d", i), fmt.Sprintf("gpu-%d", i))
+		}
+	} else {
+		_ = config.Resources.AddGPUResource("*", "gpu")
+	}
+
 	if config.Flags.MigStrategy == nil {
 		return nil
 	}

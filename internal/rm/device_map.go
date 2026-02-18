@@ -121,13 +121,20 @@ func (b *deviceMapBuilder) buildGPUDeviceMap() (DeviceMap, error) {
 		if migEnabled && *b.migStrategy != spec.MigStrategyNone {
 			return nil
 		}
+		matched := false
 		for _, resource := range b.resources.GPUs {
-			if resource.Pattern.Matches(name) {
+			if resource.Pattern.Matches(name) || resource.Pattern.Matches(fmt.Sprintf("%d", i)) {
 				index, info := b.newGPUDevice(i, gpu)
-				return devices.setEntry(resource.Name, index, info)
+				if err := devices.setEntry(resource.Name, index, info); err != nil {
+					return err
+				}
+				matched = true
 			}
 		}
-		return fmt.Errorf("GPU name '%v' does not match any resource patterns", name)
+		if !matched {
+			return fmt.Errorf("GPU name '%v' does not match any resource patterns", name)
+		}
+		return nil
 	})
 	return devices, err
 }
