@@ -54,7 +54,7 @@ func (r *resourceManager) distributedAlloc(available, required []string, size in
 	// Grab the set of 'needed' devices one-by-one from the candidates list.
 	// Before selecting each candidate, first sort the candidate list using the
 	// replicas map above. After sorting, the first element in the list will
-	// contain the device with the least difference between total and available
+	// contain the device with the most difference between total and available
 	// replications (based on what's already been allocated). Add this device
 	// to the list of devices to allocate, remove it from the candidate list,
 	// down its available count in the replicas map, and repeat.
@@ -65,7 +65,12 @@ func (r *resourceManager) distributedAlloc(available, required []string, size in
 			jid := AnnotatedID(candidates[j]).GetID()
 			idiff := replicas[iid].total - replicas[iid].available
 			jdiff := replicas[jid].total - replicas[jid].available
-			return idiff < jdiff
+			// Use bin-packing: prefer devices that have the most replicas already allocated.
+			// If idiff > jdiff, then device i has more replicas allocated than device j.
+			if idiff != jdiff {
+				return idiff > jdiff
+			}
+			return iid < jid
 		})
 		id := AnnotatedID(candidates[0]).GetID()
 		replicas[id].available--
