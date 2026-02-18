@@ -67,6 +67,8 @@ type CommandLineFlags struct {
 	MOFEDEnabled            *bool                   `json:"mofedEnabled"               yaml:"mofedEnabled"`
 	UseNodeFeatureAPI       *bool                   `json:"useNodeFeatureAPI"          yaml:"useNodeFeatureAPI"`
 	DeviceDiscoveryStrategy *string                 `json:"deviceDiscoveryStrategy"    yaml:"deviceDiscoveryStrategy"`
+	NamedResources          *bool                   `json:"namedResources"             yaml:"namedResources"`
+	MpsMemoryLimiting       *bool                   `json:"mpsMemoryLimiting"          yaml:"mpsMemoryLimiting"`
 	Plugin                  *PluginCommandLineFlags `json:"plugin,omitempty"           yaml:"plugin,omitempty"`
 	GFD                     *GFDCommandLineFlags    `json:"gfd,omitempty"              yaml:"gfd,omitempty"`
 }
@@ -139,6 +141,10 @@ func (f *Flags) UpdateFromCLIFlags(c *cli.Context, flags []cli.Flag) {
 				updateFromCLIFlag(&f.UseNodeFeatureAPI, c, n)
 			case "device-discovery-strategy":
 				updateFromCLIFlag(&f.DeviceDiscoveryStrategy, c, n)
+			case "named-resources":
+				updateFromCLIFlag(&f.NamedResources, c, n)
+			case "mps-memory-limiting":
+				updateFromCLIFlag(&f.MpsMemoryLimiting, c, n)
 			}
 			// Plugin specific flags
 			if f.Plugin == nil {

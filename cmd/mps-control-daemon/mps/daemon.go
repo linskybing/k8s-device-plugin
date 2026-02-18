@@ -68,6 +68,11 @@ func (d *Daemon) Devices() rm.Devices {
 	return d.rm.Devices()
 }
 
+// ResourceManager returns the resource manager associated with the MPS daemon.
+func (d *Daemon) ResourceManager() rm.ResourceManager {
+	return d.rm
+}
+
 type envvars map[string]string
 
 func (e envvars) toSlice() []string {
@@ -116,12 +121,14 @@ func (d *Daemon) Start() error {
 		return err
 	}
 
-	for index, limit := range d.perDevicePinnedDeviceMemoryLimits() {
-		_, err := d.EchoPipeToControl(fmt.Sprintf("set_default_device_pinned_mem_limit %s %s", index, limit))
-		if err != nil {
-			return fmt.Errorf("error setting pinned memory limit for device %v: %w", index, err)
+	/*
+		for index, limit := range d.perDevicePinnedDeviceMemoryLimits() {
+			_, err := d.EchoPipeToControl(fmt.Sprintf("set_default_device_pinned_mem_limit %s %s", index, limit))
+			if err != nil {
+				return fmt.Errorf("error setting pinned memory limit for device %v: %w", index, err)
+			}
 		}
-	}
+	*/
 	if threadPercentage := d.activeThreadPercentage(); threadPercentage != "" {
 		_, err := d.EchoPipeToControl(fmt.Sprintf("set_default_active_thread_percentage %s", threadPercentage))
 		if err != nil {
