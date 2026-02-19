@@ -53,7 +53,9 @@ func NewConfig(c *cli.Context, flags []cli.Flag) (*Config, error) {
 		}
 	}
 
-	config.Flags.UpdateFromCLIFlags(c, flags)
+	if err := config.Flags.UpdateFromCLIFlags(c, flags); err != nil {
+		return nil, fmt.Errorf("error updating flags from CLI: %w", err)
+	}
 	// TODO: This is currently not at the flags level?
 	// Does this mean that we should move UpdateFromCLIFlags to function off Config?
 	if c.IsSet("imex-channel-ids") {

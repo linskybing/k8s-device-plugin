@@ -98,7 +98,8 @@ func (m *manager) Daemons() ([]*Daemon, error) {
 				return nil, fmt.Errorf("invalid MPS configuration: %w", err)
 			}
 		}
-		daemon := NewDaemon(resourceManager, ContainerRoot)
+		memoryLimiting := m.config.Flags.MpsMemoryLimiting != nil && *m.config.Flags.MpsMemoryLimiting
+		daemon := NewDaemon(resourceManager, ContainerRoot, memoryLimiting)
 		daemons = append(daemons, daemon)
 	}
 

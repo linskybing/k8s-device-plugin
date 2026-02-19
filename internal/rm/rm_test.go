@@ -133,6 +133,8 @@ func TestValidateRequest(t *testing.T) {
 			requestDevicesIDs: []string{"device0::1"},
 		},
 		{
+			// MPS allows multi-replica requests to support milli-GPU (e.g., 700m = 7 replicas).
+			// FailRequestsGreaterThanOne does NOT apply to MPS.
 			description: "MPS with two devices",
 			sharing: spec.Sharing{
 				MPS: &spec.ReplicatedResources{
@@ -151,10 +153,11 @@ func TestValidateRequest(t *testing.T) {
 				"device1::1": nil,
 			},
 			requestDevicesIDs: []string{"device0::1", "device1::0"},
-			expectedError:     errInvalidRequest,
 		},
 		{
-			description: "MPS with two devices -- failRequestsGreaterThanOne",
+			// FailRequestsGreaterThanOne is ignored for MPS; multi-replica requests
+			// are always allowed because milli-GPU requires them.
+			description: "MPS with two devices -- failRequestsGreaterThanOne ignored",
 			sharing: spec.Sharing{
 				MPS: &spec.ReplicatedResources{
 					FailRequestsGreaterThanOne: true,
@@ -173,7 +176,6 @@ func TestValidateRequest(t *testing.T) {
 				"device1::1": nil,
 			},
 			requestDevicesIDs: []string{"device0::1", "device1::0"},
-			expectedError:     errInvalidRequest,
 		},
 	}
 

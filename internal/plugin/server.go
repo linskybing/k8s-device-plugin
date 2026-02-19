@@ -48,6 +48,12 @@ const (
 	deviceListAsVolumeMountsContainerPathRoot = "/var/run/nvidia-container-devices"
 )
 
+// healthEvent carries a device health state change notification.
+type healthEvent struct {
+	device  *rm.Device
+	healthy bool
+}
+
 // nvidiaDevicePlugin implements the Kubernetes device plugin API
 type nvidiaDevicePlugin struct {
 	pluginapi.UnimplementedDevicePluginServer
@@ -61,7 +67,7 @@ type nvidiaDevicePlugin struct {
 
 	socket string
 	server *grpc.Server
-	health chan *rm.Device
+	health chan healthEvent
 	stop   chan interface{}
 
 	imexChannels imex.Channels
@@ -108,7 +114,7 @@ func getPluginSocketPath(resource spec.ResourceName) string {
 
 func (plugin *nvidiaDevicePlugin) initialize() {
 	plugin.server = grpc.NewServer([]grpc.ServerOption{}...)
-	plugin.health = make(chan *rm.Device)
+	plugin.health = make(chan healthEvent)
 	plugin.stop = make(chan interface{})
 }
 
@@ -130,6 +136,7 @@ func (plugin *nvidiaDevicePlugin) Start(kubeletSocket string) error {
 	plugin.initialize()
 
 	if err := plugin.mps.waitForDaemon(); err != nil {
+		plugin.cleanup()
 		return fmt.Errorf("error waiting for MPS daemon: %w", err)
 	}
 
@@ -149,8 +156,25 @@ func (plugin *nvidiaDevicePlugin) Start(kubeletSocket string) error {
 	klog.Infof("Registered device plugin for '%s' with Kubelet", plugin.rm.Resource())
 
 	go func() {
+		// Adapter: rm.CheckHealth sends *rm.Device; wrap into healthEvent so ListAndWatch
+		// can set health bidirectionally (healthy=false for now; extend for recovery later).
+		unhealthyCh := make(chan *rm.Device)
+		go func() {
+			for {
+				select {
+				case d := <-unhealthyCh:
+					select {
+					case plugin.health <- healthEvent{device: d, healthy: false}:
+					case <-plugin.stop:
+						return
+					}
+				case <-plugin.stop:
+					return
+				}
+			}
+		}()
 		// TODO: add MPS health check
-		err := plugin.rm.CheckHealth(plugin.stop, plugin.health)
+		err := plugin.rm.CheckHealth(plugin.stop, unhealthyCh)
 		if err != nil {
 			klog.Errorf("Failed to start health check: %v; continuing with health checks disabled", err)
 		}
@@ -273,12 +297,16 @@ func (plugin *nvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.D
 		select {
 		case <-plugin.stop:
 			return nil
-		case d := <-plugin.health:
-			// FIXME: there is no way to recover from the Unhealthy state.
-			d.Health = pluginapi.Unhealthy
-			klog.Infof("'%s' device marked unhealthy: %s", plugin.rm.Resource(), d.ID)
+		case e := <-plugin.health:
+			if e.healthy {
+				e.device.Health = pluginapi.Healthy
+				klog.Infof("'%s' device marked healthy: %s", plugin.rm.Resource(), e.device.ID)
+			} else {
+				e.device.Health = pluginapi.Unhealthy
+				klog.Infof("'%s' device marked unhealthy: %s", plugin.rm.Resource(), e.device.ID)
+			}
 			if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
-				return nil
+				return err
 			}
 		}
 	}
@@ -288,7 +316,21 @@ func (plugin *nvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.D
 func (plugin *nvidiaDevicePlugin) GetPreferredAllocation(ctx context.Context, r *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
 	response := &pluginapi.PreferredAllocationResponse{}
 	for _, req := range r.ContainerRequests {
-		devices, err := plugin.rm.GetPreferredAllocation(req.AvailableDeviceIDs, req.MustIncludeDeviceIDs, int(req.AllocationSize))
+		// BUG-21: AvailableDeviceIDs comes from kubelet's cached view and may include
+		// devices that became unhealthy after the last ListAndWatch update was processed.
+		// Filter to only devices the plugin currently considers healthy.
+		healthyIDs := make([]string, 0, len(req.AvailableDeviceIDs))
+		for _, id := range req.AvailableDeviceIDs {
+			dev := plugin.rm.Devices().GetByID(id)
+			if dev == nil || dev.Health == pluginapi.Healthy {
+				healthyIDs = append(healthyIDs, id)
+			}
+		}
+		if len(healthyIDs) < int(req.AllocationSize) {
+			return nil, fmt.Errorf("not enough healthy devices: have %d, need %d", len(healthyIDs), req.AllocationSize)
+		}
+
+		devices, err := plugin.rm.GetPreferredAllocation(healthyIDs, req.MustIncludeDeviceIDs, int(req.AllocationSize))
 		if err != nil {
 			return nil, fmt.Errorf("error getting list of preferred allocation devices: %v", err)
 		}
