@@ -51,15 +51,18 @@ type Daemon struct {
 	// root represents the root at which the files and folders controlled by the
 	// daemon are created. These include the log and pipe directories.
 	root Root
+	// memoryLimiting enables per-device pinned memory limits via MPS control daemon.
+	memoryLimiting bool
 	// logTailer tails the MPS control daemon logs.
 	logTailer *tailer
 }
 
 // NewDaemon creates an MPS daemon instance.
-func NewDaemon(rm rm.ResourceManager, root Root) *Daemon {
+func NewDaemon(rm rm.ResourceManager, root Root, memoryLimiting bool) *Daemon {
 	return &Daemon{
-		rm:   rm,
-		root: root,
+		rm:             rm,
+		root:           root,
+		memoryLimiting: memoryLimiting,
 	}
 }
 
@@ -121,14 +124,14 @@ func (d *Daemon) Start() error {
 		return err
 	}
 
-	/*
+	if d.memoryLimiting {
 		for index, limit := range d.perDevicePinnedDeviceMemoryLimits() {
-			_, err := d.EchoPipeToControl(fmt.Sprintf("set_default_device_pinned_mem_limit %s %s", index, limit))
-			if err != nil {
+			if _, err := d.EchoPipeToControl(
+				fmt.Sprintf("set_default_device_pinned_mem_limit %s %s", index, limit)); err != nil {
 				return fmt.Errorf("error setting pinned memory limit for device %v: %w", index, err)
 			}
 		}
-	*/
+	}
 	if threadPercentage := d.activeThreadPercentage(); threadPercentage != "" {
 		_, err := d.EchoPipeToControl(fmt.Sprintf("set_default_active_thread_percentage %s", threadPercentage))
 		if err != nil {
@@ -281,7 +284,14 @@ func (m *Daemon) activeThreadPercentage() string {
 	if len(m.Devices()) == 0 {
 		return ""
 	}
-	replicasPerDevice := len(m.Devices()) / len(m.Devices().GetUUIDs())
-
-	return fmt.Sprintf("%d", 100/replicasPerDevice)
+	uuids := m.Devices().GetUUIDs()
+	if len(uuids) == 0 {
+		return ""
+	}
+	replicasPerDevice := len(m.Devices()) / len(uuids)
+	if replicasPerDevice == 0 {
+		return ""
+	}
+	pct := float64(100) / float64(replicasPerDevice)
+	return fmt.Sprintf("%.1f", pct)
 }

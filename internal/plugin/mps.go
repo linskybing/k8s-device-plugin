@@ -54,7 +54,7 @@ func (o *options) getMPSOptions(resourceManager rm.ResourceManager) (mpsOptions,
 		enabled:        true,
 		memoryLimiting: o.config.Flags.MpsMemoryLimiting != nil && *o.config.Flags.MpsMemoryLimiting,
 		resourceName:   resourceManager.Resource(),
-		daemon:         mps.NewDaemon(resourceManager, mps.ContainerRoot),
+		daemon:         mps.NewDaemon(resourceManager, mps.ContainerRoot, o.config.Flags.MpsMemoryLimiting != nil && *o.config.Flags.MpsMemoryLimiting),
 		hostRoot:       mps.Root(*o.config.Flags.MpsRoot),
 	}
 	return m, nil
@@ -102,8 +102,9 @@ func (m *mpsOptions) updateResponse(response *pluginapi.ContainerAllocateRespons
 		}
 
 		if replicas > 0 {
-			// Calculate average percentage per allocated GPU.
-			percentage := (totalRequested * 100) / (numGPUs * replicas)
+			// Calculate average percentage per allocated GPU (ceiling division to avoid underallocation).
+			denom := numGPUs * replicas
+			percentage := (totalRequested*100 + denom - 1) / denom
 			if percentage > 100 {
 				percentage = 100
 			}

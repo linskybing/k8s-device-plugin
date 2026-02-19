@@ -81,11 +81,9 @@ func (r *resourceManager) ValidateRequest(ids AnnotatedIDs) error {
 			return fmt.Errorf("%w: maximum request size for shared resources is 1; found %d", errInvalidRequest, numRequestedDevices)
 		}
 	case spec.SharingStrategyMPS:
-		// For MPS sharing, we allow multiple devices to be requested to
-		// support milli-GPU requests (e.g., 700m).
-		if includesReplicas && numRequestedDevices > 1 && r.config.Sharing.ReplicatedResources().FailRequestsGreaterThanOne {
-			return fmt.Errorf("%w: maximum request size for shared resources is 1; found %d", errInvalidRequest, numRequestedDevices)
-		}
+		// MPS supports milli-GPU: multiple replicas may be requested
+		// to represent fractional GPU (e.g., 700m on 1000m replicas).
+		// No upper bound check here — bin-packing handles allocation.
 	}
 	return nil
 }
@@ -93,8 +91,14 @@ func (r *resourceManager) ValidateRequest(ids AnnotatedIDs) error {
 // AddDefaultResourcesToConfig adds default resource matching rules to config.Resources
 func AddDefaultResourcesToConfig(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, config *spec.Config) error {
 	if config.Flags.NamedResources != nil && *config.Flags.NamedResources {
-		for i := 0; i < 32; i++ {
-			_ = config.Resources.AddGPUResource(fmt.Sprintf("%d", i), fmt.Sprintf("gpu-%d", i))
+		gpuCount, err := detectGPUCount(infolib, nvmllib, config)
+		if err != nil {
+			klog.Warningf("failed to detect GPU count for named resources: %v; falling back to generic resource", err)
+			_ = config.Resources.AddGPUResource("*", "gpu")
+		} else {
+			for i := 0; i < gpuCount; i++ {
+				_ = config.Resources.AddGPUResource(fmt.Sprintf("%d", i), fmt.Sprintf("gpu-%d", i))
+			}
 		}
 	} else {
 		_ = config.Resources.AddGPUResource("*", "gpu")
@@ -138,4 +142,32 @@ func AddDefaultResourcesToConfig(infolib info.Interface, nvmllib nvml.Interface,
 		})
 	}
 	return nil
+}
+
+// detectGPUCount queries NVML for the actual number of GPU devices on this node.
+// Returns an error if NVML is unavailable (e.g., CPU-only development machines).
+func detectGPUCount(infolib info.Interface, nvmllib nvml.Interface, config *spec.Config) (int, error) {
+	hasNVML, reason := infolib.HasNvml()
+	if !hasNVML {
+		return 0, fmt.Errorf("NVML not available: %v", reason)
+	}
+
+	ret := nvmllib.Init()
+	if ret != nvml.SUCCESS {
+		if config.Flags.FailOnInitError != nil && *config.Flags.FailOnInitError {
+			return 0, fmt.Errorf("failed to initialize NVML: %v", ret)
+		}
+		return 0, fmt.Errorf("NVML init failed: %v", ret)
+	}
+	defer func() {
+		if ret := nvmllib.Shutdown(); ret != nvml.SUCCESS {
+			klog.Errorf("Error shutting down NVML: %v", ret)
+		}
+	}()
+
+	count, ret := nvmllib.DeviceGetCount()
+	if ret != nvml.SUCCESS {
+		return 0, fmt.Errorf("failed to get GPU device count: %v", ret)
+	}
+	return count, nil
 }
