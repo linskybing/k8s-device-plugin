@@ -1,0 +1,49 @@
+site_name: K8s Device Plugin
+site_url: https://example.com/
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to dark mode
+    - scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - search.highlight
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Concepts:
+    - GPU Sharing: sharing.md
+    - Milli-GPU Support: milli-gpu.md
+  - Guide:
+    - Configuration: configuration.md
+    - Installation: installation.md
+  - Development:
+    - Building: building.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - attr_list
+  - md_in_html
+  - tables
