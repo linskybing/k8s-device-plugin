@@ -28,8 +28,9 @@ func ptr[T any](x T) *T {
 	return &x
 }
 
-// updateFromCLIFlag conditionally updates the config flag at 'pflag' to the value of the CLI flag with name 'flagName'
-func updateFromCLIFlag[T any](pflag **T, c *cli.Context, flagName string) {
+// updateFromCLIFlag conditionally updates the config flag at 'pflag' to the value of the CLI flag with name 'flagName'.
+// Returns an error if the flag type is not supported.
+func updateFromCLIFlag[T any](pflag **T, c *cli.Context, flagName string) error {
 	if c.IsSet(flagName) || *pflag == (*T)(nil) {
 		switch flag := any(pflag).(type) {
 		case **string:
@@ -45,9 +46,10 @@ func updateFromCLIFlag[T any](pflag **T, c *cli.Context, flagName string) {
 		case **deviceListStrategyFlag:
 			*flag = ptr((deviceListStrategyFlag)(c.StringSlice(flagName)))
 		default:
-			panic(fmt.Errorf("unsupported flag type for %v: %T", flagName, flag))
+			return fmt.Errorf("unsupported flag type for %v: %T", flagName, flag)
 		}
 	}
+	return nil
 }
 
 // Flags holds the full list of flags used to configure the device plugin and GFD.
@@ -116,35 +118,40 @@ type GFDCommandLineFlags struct {
 }
 
 // UpdateFromCLIFlags updates Flags from settings in the cli Flags if they are set.
-func (f *Flags) UpdateFromCLIFlags(c *cli.Context, flags []cli.Flag) {
+// Returns any error encountered while parsing flag types.
+func (f *Flags) UpdateFromCLIFlags(c *cli.Context, flags []cli.Flag) error {
 	for _, flag := range flags {
 		for _, n := range flag.Names() {
+			var err error
 			// Common flags
 			switch n {
 			case "mig-strategy":
-				updateFromCLIFlag(&f.MigStrategy, c, n)
+				err = updateFromCLIFlag(&f.MigStrategy, c, n)
 			case "fail-on-init-error":
-				updateFromCLIFlag(&f.FailOnInitError, c, n)
+				err = updateFromCLIFlag(&f.FailOnInitError, c, n)
 			case "mps-root":
-				updateFromCLIFlag(&f.MpsRoot, c, n)
+				err = updateFromCLIFlag(&f.MpsRoot, c, n)
 			case "driver-root", "nvidia-driver-root":
-				updateFromCLIFlag(&f.NvidiaDriverRoot, c, n)
+				err = updateFromCLIFlag(&f.NvidiaDriverRoot, c, n)
 			case "dev-root", "nvidia-dev-root":
-				updateFromCLIFlag(&f.NvidiaDevRoot, c, n)
+				err = updateFromCLIFlag(&f.NvidiaDevRoot, c, n)
 			case "gdrcopy-enabled":
-				updateFromCLIFlag(&f.GDRCopyEnabled, c, n)
+				err = updateFromCLIFlag(&f.GDRCopyEnabled, c, n)
 			case "gds-enabled":
-				updateFromCLIFlag(&f.GDSEnabled, c, n)
+				err = updateFromCLIFlag(&f.GDSEnabled, c, n)
 			case "mofed-enabled":
-				updateFromCLIFlag(&f.MOFEDEnabled, c, n)
+				err = updateFromCLIFlag(&f.MOFEDEnabled, c, n)
 			case "use-node-feature-api":
-				updateFromCLIFlag(&f.UseNodeFeatureAPI, c, n)
+				err = updateFromCLIFlag(&f.UseNodeFeatureAPI, c, n)
 			case "device-discovery-strategy":
-				updateFromCLIFlag(&f.DeviceDiscoveryStrategy, c, n)
+				err = updateFromCLIFlag(&f.DeviceDiscoveryStrategy, c, n)
 			case "named-resources":
-				updateFromCLIFlag(&f.NamedResources, c, n)
+				err = updateFromCLIFlag(&f.NamedResources, c, n)
 			case "mps-memory-limiting":
-				updateFromCLIFlag(&f.MpsMemoryLimiting, c, n)
+				err = updateFromCLIFlag(&f.MpsMemoryLimiting, c, n)
+			}
+			if err != nil {
+				return err
 			}
 			// Plugin specific flags
 			if f.Plugin == nil {
@@ -152,17 +159,20 @@ func (f *Flags) UpdateFromCLIFlags(c *cli.Context, flags []cli.Flag) {
 			}
 			switch n {
 			case "pass-device-specs":
-				updateFromCLIFlag(&f.Plugin.PassDeviceSpecs, c, n)
+				err = updateFromCLIFlag(&f.Plugin.PassDeviceSpecs, c, n)
 			case "device-list-strategy":
-				updateFromCLIFlag(&f.Plugin.DeviceListStrategy, c, n)
+				err = updateFromCLIFlag(&f.Plugin.DeviceListStrategy, c, n)
 			case "device-id-strategy":
-				updateFromCLIFlag(&f.Plugin.DeviceIDStrategy, c, n)
+				err = updateFromCLIFlag(&f.Plugin.DeviceIDStrategy, c, n)
 			case "cdi-annotation-prefix":
-				updateFromCLIFlag(&f.Plugin.CDIAnnotationPrefix, c, n)
+				err = updateFromCLIFlag(&f.Plugin.CDIAnnotationPrefix, c, n)
 			case "nvidia-cdi-hook-path", "nvidia-ctk-path":
-				updateFromCLIFlag(&f.Plugin.NvidiaCTKPath, c, n)
+				err = updateFromCLIFlag(&f.Plugin.NvidiaCTKPath, c, n)
 			case "container-driver-root":
-				updateFromCLIFlag(&f.Plugin.ContainerDriverRoot, c, n)
+				err = updateFromCLIFlag(&f.Plugin.ContainerDriverRoot, c, n)
+			}
+			if err != nil {
+				return err
 			}
 			// GFD specific flags
 			if f.GFD == nil {
@@ -170,16 +180,20 @@ func (f *Flags) UpdateFromCLIFlags(c *cli.Context, flags []cli.Flag) {
 			}
 			switch n {
 			case "oneshot":
-				updateFromCLIFlag(&f.GFD.Oneshot, c, n)
+				err = updateFromCLIFlag(&f.GFD.Oneshot, c, n)
 			case "output-file":
-				updateFromCLIFlag(&f.GFD.OutputFile, c, n)
+				err = updateFromCLIFlag(&f.GFD.OutputFile, c, n)
 			case "sleep-interval":
-				updateFromCLIFlag(&f.GFD.SleepInterval, c, n)
+				err = updateFromCLIFlag(&f.GFD.SleepInterval, c, n)
 			case "no-timestamp":
-				updateFromCLIFlag(&f.GFD.NoTimestamp, c, n)
+				err = updateFromCLIFlag(&f.GFD.NoTimestamp, c, n)
 			case "machine-type-file":
-				updateFromCLIFlag(&f.GFD.MachineTypeFile, c, n)
+				err = updateFromCLIFlag(&f.GFD.MachineTypeFile, c, n)
+			}
+			if err != nil {
+				return err
 			}
 		}
 	}
+	return nil
 }

@@ -52,30 +52,43 @@ func (r *resourceManager) distributedAlloc(available, required []string, size in
 	}
 
 	// Grab the set of 'needed' devices one-by-one from the candidates list.
-	// Before selecting each candidate, first sort the candidate list using the
-	// replicas map above. After sorting, the first element in the list will
-	// contain the device with the most difference between total and available
-	// replications (based on what's already been allocated). Add this device
-	// to the list of devices to allocate, remove it from the candidate list,
-	// down its available count in the replicas map, and repeat.
+	// Sort once before the loop; after each pick, do a single O(n) pass to
+	// bubble up any candidates that share the same base device ID (their
+	// allocated count just increased, so they rank higher now).
+	lessFunc := func(a, b string) bool {
+		aid := AnnotatedID(a).GetID()
+		bid := AnnotatedID(b).GetID()
+		adiff := replicas[aid].total - replicas[aid].available
+		bdiff := replicas[bid].total - replicas[bid].available
+		if adiff != bdiff {
+			return adiff > bdiff
+		}
+		return aid < bid
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return lessFunc(candidates[i], candidates[j])
+	})
+
 	var devices []string
 	for i := 0; i < needed; i++ {
-		sort.Slice(candidates, func(i, j int) bool {
-			iid := AnnotatedID(candidates[i]).GetID()
-			jid := AnnotatedID(candidates[j]).GetID()
-			idiff := replicas[iid].total - replicas[iid].available
-			jdiff := replicas[jid].total - replicas[jid].available
-			// Use bin-packing: prefer devices that have the most replicas already allocated.
-			// If idiff > jdiff, then device i has more replicas allocated than device j.
-			if idiff != jdiff {
-				return idiff > jdiff
-			}
-			return iid < jid
-		})
-		id := AnnotatedID(candidates[0]).GetID()
-		replicas[id].available--
-		devices = append(devices, candidates[0])
+		pick := candidates[0]
+		pickedID := AnnotatedID(pick).GetID()
+		replicas[pickedID].available--
+		devices = append(devices, pick)
 		candidates = candidates[1:]
+
+		// Bubble up candidates whose base ID matches the picked device:
+		// their idiff just increased, so they may need to move forward.
+		for j := 0; j < len(candidates); j++ {
+			if AnnotatedID(candidates[j]).GetID() != pickedID {
+				continue
+			}
+			// Insertion: move candidates[j] forward while it beats its predecessor.
+			for j > 0 && lessFunc(candidates[j], candidates[j-1]) {
+				candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
+				j--
+			}
+		}
 	}
 
 	// Add the set of required devices to this list and return it.
