@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: nvidia-device-plugin
+  labels:
+    app: nvidia-device-plugin
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-device-plugin
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: nvidia-device-plugin
+    spec:
+      priorityClassName: system-node-critical
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: feature.node.kubernetes.io/pci-10de.present
+                    operator: In
+                    values: ["true"]
+      initContainers:
+        - name: nvidia-driver-validation
+          image: nvcr.io/nvidia/cuda:12.3.1-base-ubi8
+          command: ["nvidia-smi"]
+          securityContext:
+            privileged: true
+      containers:
+        - name: nvidia-device-plugin-ctr
+          # platform custom build with MPS milli-GPU support
+          image: docker.io/linskybing/k8s-device-plugin:v0.19.0-mps
+          env:
+            - name: NVIDIA_MPS_PIPE_DIRECTORY
+              value: /tmp/nvidia-mps
+            - name: NVIDIA_MPS_LOG_DIRECTORY
+              value: /tmp/nvidia-log
+          args:
+            - --config-file=/etc/nvidia/config.yaml
+            - --mps-memory-limiting=true
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: nvidia-config
+              mountPath: /etc/nvidia
+            - name: mps-shm
+              mountPath: /dev/shm
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: nvidia-config
+          configMap:
+            name: nvidia-device-plugin-config
+        - name: mps-shm
+          emptyDir:
+            medium: Memory
