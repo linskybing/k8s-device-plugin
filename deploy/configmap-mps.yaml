@@ -4,11 +4,25 @@ metadata:
   name: nvidia-device-plugin-config
   namespace: nvidia-device-plugin
 data:
-  config.yaml: |
+  mps-1000: |
     version: v1
+    flags:
+      migStrategy: none
+      plugin:
+        passDeviceSpecs: true
+        deviceListStrategy:
+          - envvar
+          - cdi-annotations
+        deviceIDStrategy: uuid
+    resources:
+      gpus:
+        - pattern: "*"
+          name: gpu
     sharing:
       mps:
+        renameByDefault: false
+        failRequestsGreaterThanOne: false
         resources:
           - name: nvidia.com/gpu
             replicas: 1000
-            devices: all
+            devices: "all"

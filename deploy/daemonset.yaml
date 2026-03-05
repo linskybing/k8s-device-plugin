@@ -18,51 +18,222 @@ spec:
     spec:
       priorityClassName: system-node-critical
       tolerations:
-        - key: nvidia.com/gpu
-          operator: Exists
-          effect: NoSchedule
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: feature.node.kubernetes.io/pci-10de.present
-                    operator: In
-                    values: ["true"]
+        - operator: Exists
+      nodeSelector:
+        nvidia.com/mps.capable: "true"
       initContainers:
-        - name: nvidia-driver-validation
-          image: nvcr.io/nvidia/cuda:12.3.1-base-ubi8
-          command: ["nvidia-smi"]
-          securityContext:
-            privileged: true
+        - name: nvidia-device-plugin-init
+          image: docker.io/linskybing/k8s-device-plugin:v0.19.0-mps
+          command: ["config-manager"]
+          env:
+            - name: ONESHOT
+              value: "true"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_LABEL
+              value: nvidia.com/device-plugin.config
+            - name: CONFIG_FILE_SRCDIR
+              value: /available-configs
+            - name: CONFIG_FILE_DST
+              value: /config/config.yaml
+            - name: DEFAULT_CONFIG
+              value: mps-1000
+            - name: FALLBACK_STRATEGIES
+              value: named
+          volumeMounts:
+            - name: available-configs
+              mountPath: /available-configs
+            - name: config
+              mountPath: /config
       containers:
+        - name: nvidia-device-plugin-sidecar
+          image: docker.io/linskybing/k8s-device-plugin:v0.19.0-mps
+          command: ["config-manager"]
+          env:
+            - name: ONESHOT
+              value: "false"
+            - name: KUBECONFIG
+              value: ""
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_LABEL
+              value: nvidia.com/device-plugin.config
+            - name: CONFIG_FILE_SRCDIR
+              value: /available-configs
+            - name: CONFIG_FILE_DST
+              value: /config/config.yaml
+            - name: DEFAULT_CONFIG
+              value: mps-1000
+            - name: FALLBACK_STRATEGIES
+              value: named
+            - name: SEND_SIGNAL
+              value: "true"
+            - name: SIGNAL
+              value: "1"
+            - name: PROCESS_TO_SIGNAL
+              value: nvidia-device-plugin
+          volumeMounts:
+            - name: available-configs
+              mountPath: /available-configs
+            - name: config
+              mountPath: /config
         - name: nvidia-device-plugin-ctr
-          # platform custom build with MPS milli-GPU support
+          # platform custom build with MPS milli-GPU support (1000 replicas = milli-GPU)
           image: docker.io/linskybing/k8s-device-plugin:v0.19.0-mps
           env:
-            - name: NVIDIA_MPS_PIPE_DIRECTORY
-              value: /tmp/nvidia-mps
-            - name: NVIDIA_MPS_LOG_DIRECTORY
-              value: /tmp/nvidia-log
-          args:
-            - --config-file=/etc/nvidia/config.yaml
-            - --mps-memory-limiting=true
+            - name: MPS_ROOT
+              value: /run/nvidia/mps
+            - name: NVIDIA_DRIVER_ROOT
+              value: /
+            - name: CONFIG_FILE
+              value: /config/config.yaml
+            - name: NVIDIA_MIG_MONITOR_DEVICES
+              value: all
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
           securityContext:
             privileged: true
           volumeMounts:
-            - name: device-plugin
+            - name: kubelet-device-plugins-dir
               mountPath: /var/lib/kubelet/device-plugins
-            - name: nvidia-config
-              mountPath: /etc/nvidia
+            - name: driver-root
+              mountPath: /driver-root
             - name: mps-shm
               mountPath: /dev/shm
+            - name: mps-root
+              mountPath: /mps
+            - name: cdi-root
+              mountPath: /var/run/cdi
+            - name: available-configs
+              mountPath: /available-configs
+            - name: config
+              mountPath: /config
       volumes:
-        - name: device-plugin
+        - name: kubelet-device-plugins-dir
           hostPath:
             path: /var/lib/kubelet/device-plugins
-        - name: nvidia-config
+            type: Directory
+        - name: mps-root
+          hostPath:
+            path: /run/nvidia/mps
+            type: DirectoryOrCreate
+        - name: mps-shm
+          hostPath:
+            path: /run/nvidia/mps/shm
+        - name: driver-root
+          hostPath:
+            path: /
+            type: Directory
+        - name: cdi-root
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
+        - name: available-configs
           configMap:
             name: nvidia-device-plugin-config
+        - name: config
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-mps-control-daemon
+  namespace: nvidia-device-plugin
+  labels:
+    app: nvidia-device-plugin-mps-control-daemon
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-device-plugin-mps-control-daemon
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: nvidia-device-plugin-mps-control-daemon
+    spec:
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      nodeSelector:
+        nvidia.com/mps.capable: "true"
+      containers:
+        - name: mps-control-daemon-sidecar
+          image: docker.io/linskybing/k8s-device-plugin:v0.19.0-mps
+          command: ["config-manager"]
+          env:
+            - name: ONESHOT
+              value: "false"
+            - name: KUBECONFIG
+              value: ""
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_LABEL
+              value: nvidia.com/device-plugin.config
+            - name: CONFIG_FILE_SRCDIR
+              value: /available-configs
+            - name: CONFIG_FILE_DST
+              value: /config/config.yaml
+            - name: DEFAULT_CONFIG
+              value: mps-1000
+            - name: FALLBACK_STRATEGIES
+              value: named
+            - name: SEND_SIGNAL
+              value: "true"
+            - name: SIGNAL
+              value: "1"
+            - name: PROCESS_TO_SIGNAL
+              value: /usr/bin/mps-control-daemon
+          volumeMounts:
+            - name: available-configs
+              mountPath: /available-configs
+            - name: config
+              mountPath: /config
+        - name: mps-control-daemon-ctr
+          image: docker.io/linskybing/k8s-device-plugin:v0.19.0-mps
+          command: ["mps-control-daemon"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CONFIG_FILE
+              value: /config/config.yaml
+            - name: NVIDIA_MIG_MONITOR_DEVICES
+              value: all
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: mps-shm
+              mountPath: /dev/shm
+            - name: mps-root
+              mountPath: /mps
+            - name: available-configs
+              mountPath: /available-configs
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: mps-root
+          hostPath:
+            path: /run/nvidia/mps
+            type: DirectoryOrCreate
         - name: mps-shm
-          emptyDir:
-            medium: Memory
+          hostPath:
+            path: /run/nvidia/mps/shm
+        - name: available-configs
+          configMap:
+            name: nvidia-device-plugin-config
+        - name: config
+          emptyDir: {}
