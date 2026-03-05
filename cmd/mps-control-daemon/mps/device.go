@@ -32,10 +32,12 @@ var errInvalidDevice = errors.New("invalid device")
 type mpsDevice rm.Device
 
 // assertReplicas checks whether the number of replicas specified is valid.
+// For milli-GPU mode (high replica counts like 1000), replicas are used as
+// accounting units, not actual MPS clients. The MPS hardware limit (48 clients)
+// applies to concurrent container processes, not to replica device IDs.
 func (d *mpsDevice) assertReplicas() error {
-	maxClients := d.maxClients()
-	if d.Replicas > maxClients {
-		return fmt.Errorf("%w maximum allowed replicas exceeded: %d > %d", errInvalidDevice, d.Replicas, maxClients)
+	if d.Replicas <= 0 {
+		return fmt.Errorf("%w: replicas must be positive, got %d", errInvalidDevice, d.Replicas)
 	}
 	return nil
 }
