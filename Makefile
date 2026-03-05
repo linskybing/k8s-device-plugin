@@ -118,6 +118,9 @@ COVERAGE_FILE := coverage.out
 test: build cmds
 	go test -coverprofile=$(COVERAGE_FILE) $(MODULE)/cmd/... $(MODULE)/internal/... $(MODULE)/api/...
 
+test-mps-e2e:
+	bash $(CURDIR)/tests/mps-e2e/run.sh
+
 coverage: test
 	cat $(COVERAGE_FILE) | grep -v "_mock.go" > $(COVERAGE_FILE).no-mocks
 	go tool cover -func=$(COVERAGE_FILE).no-mocks
