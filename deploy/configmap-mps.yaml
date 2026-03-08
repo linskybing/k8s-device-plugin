@@ -4,7 +4,7 @@ metadata:
   name: nvidia-device-plugin-config
   namespace: nvidia-device-plugin
 data:
-  mps-1000: |
+  mps-100: |
     version: v1
     flags:
       migStrategy: none
@@ -24,5 +24,5 @@ data:
         failRequestsGreaterThanOne: false
         resources:
           - name: nvidia.com/gpu
-            replicas: 1000
+            replicas: 100
             devices: "all"

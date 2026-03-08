@@ -39,7 +39,7 @@ spec:
             - name: CONFIG_FILE_DST
               value: /config/config.yaml
             - name: DEFAULT_CONFIG
-              value: mps-1000
+              value: mps-100
             - name: FALLBACK_STRATEGIES
               value: named
           volumeMounts:
@@ -67,7 +67,7 @@ spec:
             - name: CONFIG_FILE_DST
               value: /config/config.yaml
             - name: DEFAULT_CONFIG
-              value: mps-1000
+              value: mps-100
             - name: FALLBACK_STRATEGIES
               value: named
             - name: SEND_SIGNAL
@@ -82,7 +82,7 @@ spec:
             - name: config
               mountPath: /config
         - name: nvidia-device-plugin-ctr
-          # platform custom build with MPS milli-GPU support (1000 replicas = milli-GPU)
+          # platform custom build with MPS shared GPU support (100 replicas per GPU)
           image: docker.io/linskybing/k8s-device-plugin:v0.19.0-mps
           env:
             - name: MPS_ROOT
@@ -183,7 +183,7 @@ spec:
             - name: CONFIG_FILE_DST
               value: /config/config.yaml
             - name: DEFAULT_CONFIG
-              value: mps-1000
+              value: mps-100
             - name: FALLBACK_STRATEGIES
               value: named
             - name: SEND_SIGNAL
