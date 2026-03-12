@@ -122,6 +122,12 @@ func (m *mpsOptions) updateResponse(response *pluginapi.ContainerAllocateRespons
 		}
 	}
 
+	// Enable hardware-enforced SM partitioning on Volta+ (CUDA 11.7+).
+	// Converts CUDA_MPS_ACTIVE_THREAD_PERCENTAGE from a soft scheduling
+	// hint to a hard SM partition, preventing one MPS client from
+	// starving others even when idle capacity is available.
+	response.Envs["CUDA_MPS_ENABLE_PER_CTX_DEVICE_MULTIPROCESSOR_PARTITIONING"] = "1"
+
 	// TODO: We should check that the deviceIDs are shared using MPS.
 	response.Envs["CUDA_MPS_PIPE_DIRECTORY"] = m.daemon.PipeDir()
 
