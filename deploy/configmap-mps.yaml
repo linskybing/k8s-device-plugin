@@ -22,6 +22,7 @@ data:
       mps:
         renameByDefault: false
         failRequestsGreaterThanOne: false
+        enableMemoryLimit: true
         resources:
           - name: nvidia.com/gpu
             replicas: 100
