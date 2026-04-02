@@ -8,10 +8,10 @@ data:
     version: v1
     flags:
       migStrategy: none
+      mpsMemoryLimiting: true
       plugin:
         passDeviceSpecs: true
         deviceListStrategy:
-          - envvar
           - cdi-annotations
         deviceIDStrategy: uuid
     resources:
@@ -22,7 +22,6 @@ data:
       mps:
         renameByDefault: false
         failRequestsGreaterThanOne: false
-        enableMemoryLimit: true
         resources:
           - name: nvidia.com/gpu
             replicas: 100
